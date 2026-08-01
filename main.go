@@ -1,25 +1,22 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/redis/go-redis/v9"
-	"sync"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
-
-var (
-	taskStore = make(map[string]*Task)
-	mu        sync.Mutex
-)
-
-type TaskStatus int
 
 const (
-	Waiting TaskStatus = iota
+	Waiting   = "waiting"
+	Running   = "running"
+	Completed = "completed"
+	Failed    = "failed"
 )
 
 type Task struct {
@@ -44,14 +41,12 @@ type SubmitRequest struct {
 	Timeout        *time.Duration  `json:"timeout,omitempty"`
 }
 
-func Submit(req SubmitRequest) (id string, err error) {
+func Submit(rdb *redis.Client, req SubmitRequest) (id string, err error) {
 	if req.TaskType == "" {
-		err = errors.New("task type is required")
-		return
+		return "", errors.New("task type is required")
 	}
 	if len(req.Payload) == 0 || string(req.Payload) == "null" {
-		err = errors.New("payload is required")
-		return
+		return "", errors.New("payload is required")
 	}
 
 	if req.MaxRetries == nil {
@@ -73,47 +68,67 @@ func Submit(req SubmitRequest) (id string, err error) {
 		IdempotencyKey: req.IdempotencyKey,
 		Delay:          req.Delay,
 		Timeout:        req.Timeout,
-		Status:         "waiting",
+		Status:         Waiting,
 		CreatedAt:      time.Now(),
 	}
 
-	mu.Lock()
-	taskStore[id] = task
-	mu.Unlock()
+	// 4. 序列化并存入 Redis
+	data, err := json.Marshal(task)
+	if err != nil {
+		return "", fmt.Errorf("marshal task: %w", err)
+	}
+
+	ctx := context.Background()
+	if err := rdb.Set(ctx, "task:"+id, data, 0).Err(); err != nil {
+		return "", fmt.Errorf("store task: %w", err)
+	}
 
 	return
 }
 
-func main() {
+var (
+	TASKQUEUE_REDIS_ADDRESS  = os.Getenv("TASKQUEUE_REDIS_ADDRESS")
+	TASKQUEUE_REDIS_PASSWORD = os.Getenv("TASKQUEUE_REDIS_PASSWORD")
+)
+
+func getRDB() *redis.Client {
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "", // no password set
-		DB:       0,  // use default DB
+		Addr:     TASKQUEUE_REDIS_ADDRESS,
+		Password: TASKQUEUE_REDIS_PASSWORD,
+		DB:       0, // use default DB
 	})
+	return rdb
+}
+
+func GetTask(rdb *redis.Client, id string) (*Task, error) {
+	key := fmt.Sprintf("task:%s", id)
+	ctx := context.TODO()
+	val, err := rdb.Get(ctx, key).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("task not found: %s", id)
+		}
+		return nil, err
+	}
+	var task Task
+	if err := json.Unmarshal([]byte(val), &task); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal task data in redis: %w", err)
+	}
+	return &task, nil
+}
+
+func main() {
+	rdb := getRDB()
 	defer rdb.Close()
-
-	err := rdb.Set(ctx, "key", "value", 0).Err()
-	if err != nil {
-		panic(err)
-	}
-
-	val, err := rdb.Get(ctx, "key").Result()
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println("key", val)
-
-	val2, err := rdb.Get(ctx, "key2").Result()
-	if err == redis.Nil {
-		fmt.Println("key2 does not exist")
-	} else if err != nil {
-		panic(err)
-	} else {
-		fmt.Println("key2", val2)
-	}
-	id, err := Submit(SubmitRequest{
+	id, err := Submit(rdb, SubmitRequest{
 		TaskType: "hello",
 		Payload:  []byte(`"balabala"`),
 	})
 	fmt.Println(id, err)
+
+	task, err := GetTask(rdb, id)
+	if err != nil {
+		fmt.Println(err)
+	}
+	fmt.Printf("%+v\n", task)
 }
