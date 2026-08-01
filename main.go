@@ -13,10 +13,10 @@ import (
 )
 
 const (
-	Waiting   = "waiting"
-	Running   = "running"
-	Completed = "completed"
-	Failed    = "failed"
+	StatusWaiting   = "waiting"
+	StatusRunning   = "running"
+	StatusCompleted = "completed"
+	StatusFailed    = "failed"
 )
 
 type Task struct {
@@ -68,7 +68,7 @@ func Submit(rdb *redis.Client, req SubmitRequest) (id string, err error) {
 		IdempotencyKey: req.IdempotencyKey,
 		Delay:          req.Delay,
 		Timeout:        req.Timeout,
-		Status:         Waiting,
+		Status:         StatusWaiting,
 		CreatedAt:      time.Now(),
 	}
 
