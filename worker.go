@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"github.com/redis/go-redis/v9"
@@ -16,8 +15,15 @@ func RunWorker(ctx context.Context, rdb *redis.Client, concurrency int) {
 
 	for i := 0; i < concurrency; i++ {
 		go func() {
-			fmt.Printf("work started\n")
 			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					rdb.BRPop(ctx, 0, taskQueueRedisKey)
+				}
+			}
 		}()
 	}
 

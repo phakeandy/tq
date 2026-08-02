@@ -86,8 +86,8 @@ func Submit(rdb *redis.Client, req SubmitRequest) (id string, err error) {
 		return "", fmt.Errorf("store task: %w", err)
 	}
 
-	if err := rdb.LPush(ctx, "task_queue", id).Err(); err != nil {
-		return "", fmt.Errorf("push to task_queue: %w", err)
+	if err := rdb.LPush(ctx, taskQueueRedisKey, id).Err(); err != nil {
+		return "", fmt.Errorf("push to task queue: %w", err)
 	}
 	return id, err
 }
