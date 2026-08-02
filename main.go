@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"time"
@@ -18,7 +19,11 @@ func main() {
 	})
 
 	rdb := getRDB()
-	defer rdb.Close()
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			log.Printf("failed to close redis connection: %w", err)
+		}
+	}()
 
 	// 启动 Worker（带优雅关闭）
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
