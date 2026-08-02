@@ -41,6 +41,9 @@ type SubmitRequest struct {
 	Timeout        *time.Duration  `json:"timeout,omitempty"`
 }
 
+// Submit enqueues a new task into Redis and returns its unique ID.
+// It validates the request, assigns default values if unset and stores the
+// serialized task in Redis under "task:<id>".
 func Submit(rdb *redis.Client, req SubmitRequest) (id string, err error) {
 	if req.TaskType == "" {
 		return "", errors.New("task type is required")
@@ -72,18 +75,21 @@ func Submit(rdb *redis.Client, req SubmitRequest) (id string, err error) {
 		CreatedAt:      time.Now(),
 	}
 
-	// 4. 序列化并存入 Redis
 	data, err := json.Marshal(task)
 	if err != nil {
 		return "", fmt.Errorf("marshal task: %w", err)
 	}
 
 	ctx := context.Background()
-	if err := rdb.Set(ctx, "task:"+id, data, 0).Err(); err != nil {
+	key := fmt.Sprintf("task:%s", id)
+	if err := rdb.Set(ctx, key, data, 0).Err(); err != nil {
 		return "", fmt.Errorf("store task: %w", err)
 	}
 
-	return
+	if err := rdb.LPush(ctx, "task_queue", id).Err(); err != nil {
+		return "", fmt.Errorf("push to task_queue: %w", err)
+	}
+	return id, err
 }
 
 var (
