@@ -21,7 +21,7 @@ func main() {
 	rdb := getRDB()
 	defer func() {
 		if err := rdb.Close(); err != nil {
-			log.Printf("failed to close redis connection: %w", err)
+			log.Printf("failed to close redis connection: %v", err)
 		}
 	}()
 
@@ -32,20 +32,23 @@ func main() {
 	go RunWorker(ctx, rdb, 2)
 
 	// 提交一个任务
-	id, err := Submit(rdb, SubmitRequest{
+	task := NewTask(Options{
 		TaskType: "hello",
 		Payload:  []byte(`"hello world"`),
 	})
-	fmt.Println("submitted:", id, err)
+	if err := task.Submit(rdb); err != nil {
+		log.Fatalf("submit task: %v", err)
+	}
+	fmt.Println("submitted:", task.ID)
 
 	// 等一下看看结果
 	time.Sleep(5 * time.Second)
 
-	task, err := getTask(rdb, id)
+	stored, err := getTask(rdb, task.ID)
 	if err != nil {
 		fmt.Println(err)
 	} else {
-		fmt.Printf("result: status=%s\n", task.Status)
+		fmt.Printf("result: status=%s\n", stored.Status)
 	}
 
 	cancel() // 优雅关闭

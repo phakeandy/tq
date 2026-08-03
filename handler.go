@@ -19,5 +19,3 @@ func RegisterHandler(taskType string, h Handler) {
 	defer handlersMu.Unlock()
 	handlers[taskType] = h
 }
-
-
