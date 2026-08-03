@@ -41,7 +41,7 @@ func main() {
 	// 等一下看看结果
 	time.Sleep(5 * time.Second)
 
-	task, err := GetTask(rdb, id)
+	task, err := getTask(rdb, id)
 	if err != nil {
 		fmt.Println(err)
 	} else {

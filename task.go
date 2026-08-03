@@ -82,17 +82,17 @@ func Submit(rdb *redis.Client, req SubmitRequest) (id string, err error) {
 
 	ctx := context.Background()
 	key := fmt.Sprintf("task:%s", id)
+	// TODO: use lua script to ensure atomtic
 	if err := rdb.Set(ctx, key, data, 0).Err(); err != nil {
 		return "", fmt.Errorf("store task: %w", err)
 	}
-
 	if err := rdb.LPush(ctx, taskQueueRedisKey, id).Err(); err != nil {
 		return "", fmt.Errorf("push to task queue: %w", err)
 	}
 	return id, err
 }
 
-func GetTask(rdb *redis.Client, id string) (*Task, error) {
+func getTask(rdb *redis.Client, id string) (*Task, error) {
 	key := fmt.Sprintf("task:%s", id)
 	ctx := context.TODO()
 	val, err := rdb.Get(ctx, key).Result()
@@ -108,3 +108,17 @@ func GetTask(rdb *redis.Client, id string) (*Task, error) {
 	}
 	return &task, nil
 }
+
+
+func writeTask(ctx context.Context, rdb *redis.Client, task *Task) error {
+	data, err := json.Marshal(task)
+	if err != nil {
+		return fmt.Errorf("marshal task: %w", err)
+	}
+	key := fmt.Sprintf("task:%s", task.ID)
+	if err := rdb.Set(ctx, key, data, 0).Err(); err != nil {
+		return fmt.Errorf("store task: %w", err)
+	}
+	return nil
+}
+
