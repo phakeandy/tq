@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func main() {
+func Example() {
 	// 注册 handler
 	RegisterHandler("hello", func(ctx context.Context, task *Task) error {
 		fmt.Printf("[worker] executing task %s, payload: %s\n", task.ID, task.Payload)

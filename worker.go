@@ -44,15 +44,29 @@ func work(ctx context.Context, wg *sync.WaitGroup, rdb *redis.Client) {
 				continue
 			}
 
-			handlerMu.RLock()
+			handlersMu.RLock()
 			handler, ok := handlers[task.TaskType]
-			handlerMu.RUnlock()
+			handlersMu.RUnlock()
 			if !ok {
-				slog.Error("no handler for task type", "taskType", task.TaskType, "err", err)
+				slog.Error("no handler for task type", "taskType", task.TaskType)
 				continue
 			}
 
 			taskCtx, cancel := context.WithTimeout(ctx, task.Timeout)
+			err = handler(taskCtx, task)
+			cancel()
+			if err != nil {
+				task.Status = StatusWaiting
+				if err := writeTask(ctx, rdb, task); err != nil {
+					slog.Error("write task", "taskID", taskID, "err", err)
+					continue
+				}
+			}
+			task.Status = StatusCompleted
+			if err := writeTask(ctx, rdb, task); err != nil {
+				slog.Error("write task", "taskID", taskID, "err", err)
+				continue
+			}
 		}
 	}
 }
