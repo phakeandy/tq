@@ -1,12 +1,13 @@
-package main
+package tq
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -23,7 +24,7 @@ type Task struct {
 	Payload        json.RawMessage `json:"payload"`
 	MaxRetries     int             `json:"maxRetries,omitempty"`
 	IdempotencyKey string          `json:"idempotencyKey,omitempty"`
-	Delay          time.Duration   `json:"delay,omitempty"` //延迟执行时间，默认立即（0）
+	Delay          time.Duration   `json:"delay,omitempty"`
 	Timeout        time.Duration   `json:"timeout,omitempty"`
 	ID             string          `json:"id,omitempty"`
 	Status         string          `json:"status"`
@@ -31,19 +32,26 @@ type Task struct {
 	Result         string          `json:"result"`
 }
 
-// Options 是调用方创建任务时能提供的参数。
+// Options keeps the settings to build a new Task.
 type Options struct {
 	TaskType       string          `json:"taskType"`
 	Payload        json.RawMessage `json:"payload"`
 	MaxRetries     *int            `json:"maxRetries,omitempty"`
 	IdempotencyKey string          `json:"idempotencyKey,omitempty"`
-	Delay          time.Duration   `json:"delay,omitempty"` //延迟执行时间，默认立即（0）
+	Delay          time.Duration   `json:"delay,omitempty"`
 	Timeout        *time.Duration  `json:"timeout,omitempty"`
 }
 
-// NewTask 纯构造：填默认值 + 系统字段（ID/Status/CreatedAt），
-// 返回的 Task 一定是完整的，可以直接 Submit。
-func NewTask(opts Options) *Task {
+// NewTask returns a new Task with default value.
+// It check weather value from opts are illegal.
+func NewTask(opts Options) (*Task, error) {
+	if opts.TaskType == "" {
+		return nil, errors.New("task type is required")
+	}
+	if len(opts.Payload) == 0 || string(opts.Payload) == "null" {
+		return nil, errors.New("payload is required")
+	}
+
 	maxRetries := 3
 	if opts.MaxRetries != nil {
 		maxRetries = *opts.MaxRetries
@@ -53,7 +61,7 @@ func NewTask(opts Options) *Task {
 		timeout = *opts.Timeout
 	}
 
-	return &Task{
+	t := &Task{
 		ID:             uuid.New().String(),
 		TaskType:       opts.TaskType,
 		Payload:        opts.Payload,
@@ -64,17 +72,11 @@ func NewTask(opts Options) *Task {
 		Status:         StatusWaiting,
 		CreatedAt:      time.Now(),
 	}
+	return t, nil
 }
 
-// Submit 校验并落库：把任务序列化后存入 "task:<id>"，再把 ID 推入队列。
+// Submit enqueues task to redis
 func (t *Task) Submit(rdb *redis.Client) error {
-	if t.TaskType == "" {
-		return errors.New("task type is required")
-	}
-	if len(t.Payload) == 0 || string(t.Payload) == "null" {
-		return errors.New("payload is required")
-	}
-
 	data, err := json.Marshal(t)
 	if err != nil {
 		return fmt.Errorf("marshal task: %w", err)

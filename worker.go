@@ -1,8 +1,8 @@
-package main
+package tq
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 
 	"github.com/redis/go-redis/v9"
@@ -29,21 +29,30 @@ func work(ctx context.Context, wg *sync.WaitGroup, rdb *redis.Client) {
 		default:
 			res, err := rdb.BRPop(ctx, 0, taskQueueRedisKey).Result()
 			if err != nil {
-				log.Printf("BRPOP task queue: %v", err)
+				slog.Error("BRPOP task queue", "err", err)
 				continue
 			}
 			taskID := res[1]
 			task, err := getTask(rdb, taskID)
 			if err != nil {
-				log.Printf("load task %s: %v", taskID, err)
+				slog.Error("load task", "taskID", taskID, "err", err)
 				continue
 			}
 			task.Status = StatusRunning
 			if err := writeTask(ctx, rdb, task); err != nil {
-				log.Printf("write task %s: %v", taskID, err)
+				slog.Error("write task", "taskID", taskID, "err", err)
 				continue
-
 			}
+
+			handlerMu.RLock()
+			handler, ok := handlers[task.TaskType]
+			handlerMu.RUnlock()
+			if !ok {
+				slog.Error("no handler for task type", "taskType", task.TaskType, "err", err)
+				continue
+			}
+
+			taskCtx, cancel := context.WithTimeout(ctx, task.Timeout)
 		}
 	}
 }

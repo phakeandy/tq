@@ -1,9 +1,9 @@
-package main
+package tq
 
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"time"
@@ -21,7 +21,7 @@ func main() {
 	rdb := getRDB()
 	defer func() {
 		if err := rdb.Close(); err != nil {
-			log.Printf("failed to close redis connection: %v", err)
+			slog.Error("failed to close redis connection", "err", err)
 		}
 	}()
 
@@ -32,12 +32,17 @@ func main() {
 	go RunWorker(ctx, rdb, 2)
 
 	// 提交一个任务
-	task := NewTask(Options{
+	task, err := NewTask(Options{
 		TaskType: "hello",
 		Payload:  []byte(`"hello world"`),
 	})
+	if err != nil {
+		slog.Error("new task", "err", err)
+		os.Exit(1)
+	}
 	if err := task.Submit(rdb); err != nil {
-		log.Fatalf("submit task: %v", err)
+		slog.Error("submit task", "err", err)
+		os.Exit(1)
 	}
 	fmt.Println("submitted:", task.ID)
 
