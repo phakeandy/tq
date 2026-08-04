@@ -1,4 +1,4 @@
-package tq
+package tq_test
 
 import (
 	"context"
@@ -7,18 +7,20 @@ import (
 	"os"
 	"os/signal"
 	"time"
+
+	tq "github.com/phakeandy/task-queue"
 )
 
-func Example() {
+func ExampleRunWorker() {
 	// 注册 handler
-	RegisterHandler("hello", func(ctx context.Context, task *Task) error {
-		fmt.Printf("[worker] executing task %s, payload: %s\n", task.ID, task.Payload)
+	tq.RegisterHandler("hello", func(ctx context.Context, task *tq.Task) error {
+		fmt.Printf("[worker] executing task, payload: %s\n", task.Payload)
 		time.Sleep(2 * time.Second)
-		fmt.Printf("[worker] task %s done\n", task.ID)
+		fmt.Println("[worker] task done")
 		return nil
 	})
 
-	rdb := getRDB()
+	rdb := tq.NewRDB()
 	defer func() {
 		if err := rdb.Close(); err != nil {
 			slog.Error("failed to close redis connection", "err", err)
@@ -29,10 +31,10 @@ func Example() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	go RunWorker(ctx, rdb, 2)
+	go tq.RunWorker(ctx, rdb, 2)
 
 	// 提交一个任务
-	task, err := NewTask(Options{
+	task, err := tq.NewTask(tq.Options{
 		TaskType: "hello",
 		Payload:  []byte(`"hello world"`),
 	})
@@ -44,12 +46,22 @@ func Example() {
 		slog.Error("submit task", "err", err)
 		os.Exit(1)
 	}
-	fmt.Println("submitted:", task.ID)
+	fmt.Println("submitted")
 
-	// 等一下看看结果
-	time.Sleep(5 * time.Second)
-
-	stored, err := getTask(rdb, task.ID)
+	// 轮询直到任务到达终态（completed/failed）
+	var stored *tq.Task
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		stored, err = tq.GetTask(rdb, task.ID)
+		if err == nil && stored.Status != tq.StatusWaiting && stored.Status != tq.StatusRunning {
+			break
+		}
+		if time.Now().After(deadline) {
+			slog.Error("timed out waiting for task")
+			os.Exit(1)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if err != nil {
 		fmt.Println(err)
 	} else {
@@ -58,4 +70,10 @@ func Example() {
 
 	cancel() // 优雅关闭
 	time.Sleep(1 * time.Second)
+
+	// Unordered output:
+	// [worker] executing task, payload: "hello world"
+	// [worker] task done
+	// submitted
+	// result: status=completed
 }

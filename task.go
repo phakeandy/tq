@@ -94,7 +94,8 @@ func (t *Task) Submit(rdb *redis.Client) error {
 	return nil
 }
 
-func getTask(rdb *redis.Client, id string) (*Task, error) {
+// GetTask loads a task by id from redis.
+func GetTask(rdb *redis.Client, id string) (*Task, error) {
 	key := fmt.Sprintf("task:%s", id)
 	ctx := context.TODO()
 	val, err := rdb.Get(ctx, key).Result()

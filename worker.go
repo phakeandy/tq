@@ -29,11 +29,14 @@ func work(ctx context.Context, wg *sync.WaitGroup, rdb *redis.Client) {
 		default:
 			res, err := rdb.BRPop(ctx, 0, taskQueueRedisKey).Result()
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				slog.Error("BRPOP task queue", "err", err)
 				continue
 			}
 			taskID := res[1]
-			task, err := getTask(rdb, taskID)
+			task, err := GetTask(rdb, taskID)
 			if err != nil {
 				slog.Error("load task", "taskID", taskID, "err", err)
 				continue
@@ -56,11 +59,12 @@ func work(ctx context.Context, wg *sync.WaitGroup, rdb *redis.Client) {
 			err = handler(taskCtx, task)
 			cancel()
 			if err != nil {
-				task.Status = StatusWaiting
+				task.Status = StatusFailed
 				if err := writeTask(ctx, rdb, task); err != nil {
 					slog.Error("write task", "taskID", taskID, "err", err)
 					continue
 				}
+				continue
 			}
 			task.Status = StatusCompleted
 			if err := writeTask(ctx, rdb, task); err != nil {
