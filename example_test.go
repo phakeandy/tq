@@ -1,4 +1,4 @@
-package tq_test
+package taskqueue_test
 
 import (
 	"context"
@@ -8,19 +8,19 @@ import (
 	"os/signal"
 	"time"
 
-	tq "github.com/phakeandy/task-queue"
+	taskqueue "github.com/phakeandy/task-queue"
 )
 
 func ExampleRunWorker() {
 	// 注册 handler
-	tq.RegisterHandler("hello", func(ctx context.Context, task *tq.Task) error {
+	taskqueue.RegisterHandler("hello", func(ctx context.Context, task *taskqueue.Task) error {
 		fmt.Printf("[worker] executing task, payload: %s\n", task.Payload)
 		time.Sleep(2 * time.Second)
 		fmt.Println("[worker] task done")
 		return nil
 	})
 
-	rdb := tq.NewRDB()
+	rdb := taskqueue.NewRDB()
 	defer func() {
 		if err := rdb.Close(); err != nil {
 			slog.Error("failed to close redis connection", "err", err)
@@ -31,10 +31,10 @@ func ExampleRunWorker() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	go tq.RunWorker(ctx, rdb, 2)
+	go taskqueue.RunWorker(ctx, rdb, 2)
 
 	// 提交一个任务
-	task, err := tq.NewTask(tq.Options{
+	task, err := taskqueue.NewTask(taskqueue.Options{
 		TaskType: "hello",
 		Payload:  []byte(`"hello world"`),
 	})
@@ -49,11 +49,11 @@ func ExampleRunWorker() {
 	fmt.Println("submitted")
 
 	// 轮询直到任务到达终态（completed/failed）
-	var stored *tq.Task
+	var stored *taskqueue.Task
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		stored, err = tq.GetTask(rdb, task.ID)
-		if err == nil && stored.Status != tq.StatusWaiting && stored.Status != tq.StatusRunning {
+		stored, err = taskqueue.GetTask(rdb, task.ID)
+		if err == nil && stored.Status != taskqueue.StatusWaiting && stored.Status != taskqueue.StatusRunning {
 			break
 		}
 		if time.Now().After(deadline) {

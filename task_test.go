@@ -1,16 +1,16 @@
-package tq_test
+package taskqueue_test
 
 import (
 	"context"
 	"testing"
 	"time"
 
-	tq "github.com/phakeandy/task-queue"
+	taskqueue "github.com/phakeandy/task-queue"
 )
 
 func TestTaskLifeCycle(t *testing.T) {
 	ctx := context.Background()
-	rdb := tq.NewRDB()
+	rdb := taskqueue.NewRDB()
 	defer rdb.Close()
 
 	// 前提：Redis 必须可用。不可用就跳过（t.Skip），
@@ -24,7 +24,7 @@ func TestTaskLifeCycle(t *testing.T) {
 	}
 
 	// ---- 阶段一：提交（此时 worker 未启动，状态断言是确定的）----
-	task, err := tq.NewTask(tq.Options{
+	task, err := taskqueue.NewTask(taskqueue.Options{
 		TaskType: "hello",
 		Payload:  []byte(`"hi"`),
 	})
@@ -38,8 +38,8 @@ func TestTaskLifeCycle(t *testing.T) {
 	if task.Timeout != 30*time.Second {
 		t.Errorf("Timeout = %v, want 30s", task.Timeout)
 	}
-	if task.Status != tq.StatusWaiting {
-		t.Errorf("Status = %q, want %q", task.Status, tq.StatusWaiting)
+	if task.Status != taskqueue.StatusWaiting {
+		t.Errorf("Status = %q, want %q", task.Status, taskqueue.StatusWaiting)
 	}
 
 	if err := task.Submit(rdb); err != nil {
@@ -48,21 +48,21 @@ func TestTaskLifeCycle(t *testing.T) {
 
 	// 提交后、消费前：状态必须是 waiting。
 	// 这里没有竞态，因为 worker 还没启动。
-	stored, err := tq.GetTask(rdb, task.ID)
+	stored, err := taskqueue.GetTask(rdb, task.ID)
 	if err != nil {
 		t.Fatalf("GetTask: %v", err)
 	}
-	if stored.Status != tq.StatusWaiting {
-		t.Errorf("status after submit = %q, want %q", stored.Status, tq.StatusWaiting)
+	if stored.Status != taskqueue.StatusWaiting {
+		t.Errorf("status after submit = %q, want %q", stored.Status, taskqueue.StatusWaiting)
 	}
 
 	// ---- 阶段二：启动 worker 消费 ----
-	tq.RegisterHandler("hello", func(ctx context.Context, _ *tq.Task) error {
+	taskqueue.RegisterHandler("hello", func(ctx context.Context, _ *taskqueue.Task) error {
 		return nil
 	})
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go tq.RunWorker(workerCtx, rdb, 2)
+	go taskqueue.RunWorker(workerCtx, rdb, 2)
 
 	// ---- 阶段三：轮询直到终态 ----
 	// 为什么轮询 + deadline，而不是 time.Sleep(5s) 后断言？
@@ -70,11 +70,11 @@ func TestTaskLifeCycle(t *testing.T) {
 	// 只会等满 5s 得到一个 "status=running" 的失败信息。轮询两者都更好。
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		stored, err = tq.GetTask(rdb, task.ID)
+		stored, err = taskqueue.GetTask(rdb, task.ID)
 		if err != nil {
 			t.Fatalf("GetTask: %v", err)
 		}
-		if stored.Status == tq.StatusCompleted || stored.Status == tq.StatusFailed {
+		if stored.Status == taskqueue.StatusCompleted || stored.Status == taskqueue.StatusFailed {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -83,7 +83,7 @@ func TestTaskLifeCycle(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	if stored.Status != tq.StatusCompleted {
-		t.Errorf("final status = %q, want %q", stored.Status, tq.StatusCompleted)
+	if stored.Status != taskqueue.StatusCompleted {
+		t.Errorf("final status = %q, want %q", stored.Status, taskqueue.StatusCompleted)
 	}
 }
