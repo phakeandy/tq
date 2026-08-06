@@ -9,12 +9,13 @@ import (
 	"github.com/redis/go-redis"
 )
 
+// Task representes ...
 type Task struct {
 	TaskInfo
 	TaskSpec
 }
 
-// TaskType represents the runtime infomation of a Task.
+// TaskType holds the runtime infomation of a Task.
 type TaskInfo struct {
 	ID        uuid.UUID
 	Status    TaskStatus
@@ -22,7 +23,7 @@ type TaskInfo struct {
 	Result    []byte
 }
 
-// TaskSpec represents the user's defination of a Task
+// TaskSpec holds the user's defination of a Task.
 type TaskSpec struct {
 	Type           string
 	Payload        []byte
@@ -42,6 +43,7 @@ type Options struct {
 	Timeout        *time.Duration
 }
 
+// TaskStatus representes the Task' status.
 type TaskStatus int
 
 const (
@@ -71,11 +73,3 @@ var _ fmt.Stringer = StatusWaiting
 
 type Consumer struct{}
 type Producer struct{}
-
-// Store ...
-type Store struct {
-	rdb redis.UniversalClient
-}
-
-func (s Store) Enqueue(ctx context.Context, t *Task)                               {}
-func (s Store) Dequeue(ctx context.Context, t *Task) (taskID uuid.UUID, err error) {}
