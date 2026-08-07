@@ -1,12 +1,35 @@
 package taskqueue_test
 
 import (
+	"context"
 	"encoding/json"
+	"os"
 	"testing"
 	"time"
 
-	"github.com/phakeandy/task-queue"
+	taskqueue "github.com/phakeandy/task-queue"
+	"github.com/redis/go-redis/v9"
 )
+
+var testRdb redis.UniversalClient
+
+func TestMain(m *testing.M) {
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:6380"
+	}
+
+	testRdb = redis.NewClient(&redis.Options{Addr: addr})
+	defer testRdb.Close() //nolint
+
+	ctx := context.Background()
+	if err := testRdb.Ping(ctx).Err(); err != nil {
+		panic("cannot connect to Redis at " + addr + ": " + err.Error())
+	}
+
+	code := m.Run()
+	os.Exit(code)
+}
 
 func TestNewTask(t *testing.T) {
 	type greet struct {
@@ -33,5 +56,13 @@ func TestNewTask(t *testing.T) {
 	}
 	if task == nil {
 		t.Fatal("NewTask returned a nil task")
+	}
+}
+
+func TestConsumer_Start(t *testing.T) {
+	s := taskqueue.NewStorer(testRdb)
+	_, err := taskqueue.NewConsumer(s, 10)
+	if err != nil {
+		t.Errorf("new consumer fail %v", err)
 	}
 }

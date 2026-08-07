@@ -1,7 +1,9 @@
 package taskqueue
 
 import (
+	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,6 +13,21 @@ import (
 type Task struct {
 	taskInfo
 	taskSpec
+}
+
+// ID returns the task's unique identifier.
+func (t *Task) ID() uuid.UUID {
+	return t.id
+}
+
+// Status returns the task's current status.
+func (t *Task) Status() TaskStatus {
+	return t.status
+}
+
+// CreatedAt returns the time the task was created.
+func (t *Task) CreatedAt() time.Time {
+	return t.createdAt
 }
 
 // TaskType holds the runtime infomation of a Task.
@@ -59,8 +76,77 @@ func (s TaskStatus) String() string {
 
 var _ fmt.Stringer = StatusWaiting
 
-type Consumer struct{}
-type Producer struct{}
+// Consumer pulls tasks from the queue and executes registered handlers.
+// It runs concurrency worker goroutines, each blocking on Dequeue, then
+// dispatching to the handler matched by task type.
+//
+// Handlers must be registered via RegisterHandler before calling Start.
+// Call Shutdown for graceful stop: it stops accepting new tasks and waits
+// for in-flight handlers to finish.
+type Consumer struct {
+	s *Storer
+
+	handlers   map[string]Handler
+	handlersMu sync.Mutex
+
+	concurrency int
+	wg          sync.WaitGroup
+	quit        chan struct{}
+}
+
+// NewConsumer creates a Consumer backed by s, ready to run at most concurrency
+// handlers concurrently.  Handlers must be registered via RegisterHandler
+// before calling Start.
+//
+// Return error if arguments is not valid.
+func NewConsumer(s *Storer, concurrency int) (*Consumer, error) {
+	if s == nil {
+		return nil, fmt.Errorf("storer must not be nil")
+	}
+	if concurrency <= 0 {
+		return nil, fmt.Errorf("concurrency must be positive, got %d", concurrency)
+	}
+	return &Consumer{
+		s:           s,
+		handlers:    make(map[string]Handler),
+		concurrency: concurrency,
+		quit:        make(chan struct{}),
+	}, nil
+}
+
+type Handler func(ctx context.Context, task *Task) error
+
+// RegisterHandler registers a handler for a given task type.
+// Must be called before Start.
+func (c *Consumer) RegisterHandler(taskType string, h Handler) {
+	c.handlersMu.Lock()
+	defer c.handlersMu.Unlock()
+	c.handlers[taskType] = h
+}
+
+// Shutdown gracefully stops all worker goroutines. It closes the quit channel
+// to signal workers to stop pulling new tasks, then waits for in-flight
+// handlers to finish via WaitGroup. Returns when all workers have exited.
+func (c *Consumer) Shutdown(ctx context.Context) error {
+	panic("TODO")
+}
+
+// Start launches concurrency worker goroutines that block on Dequeue and
+// dispatch each task to its registered handler. It blocks until ctx is
+// cancelled or Shutdown is called. Call Shutdown to stop.
+func (c *Consumer) Start(ctx context.Context) error {
+	panic("TODO")
+}
+
+// Producer TODO
+type Producer struct {
+	s  *Storer
+	mu sync.Mutex
+}
+
+func (p *Producer) Produce(ctx context.Context, t *Task) error {
+	panic("TODO")
+}
 
 // Option configures a Task created by NewTask. Options are applied in order,
 // so a later option overrides an earlier one.

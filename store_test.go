@@ -1,56 +1,32 @@
-package taskqueue
+package taskqueue_test
 
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+
+	taskqueue "github.com/phakeandy/task-queue"
 )
 
-var testRdb redis.UniversalClient
-
-func TestMain(m *testing.M) {
-	addr := os.Getenv("REDIS_ADDR")
-	if addr == "" {
-		addr = "127.0.0.1:6380"
-	}
-
-	testRdb = redis.NewClient(&redis.Options{Addr: addr})
-	defer testRdb.Close()
-
-	ctx := context.Background()
-	if err := testRdb.Ping(ctx).Err(); err != nil {
-		panic("cannot connect to Redis at " + addr + ": " + err.Error())
-	}
-
-	code := m.Run()
-	os.Exit(code)
-}
-
-func setupStorer(t *testing.T) *Storer {
+func setupStorer(t *testing.T) *taskqueue.Storer {
 	t.Helper()
 	if err := testRdb.FlushDB(context.Background()).Err(); err != nil {
 		t.Fatalf("FlushDB failed: %v", err)
 	}
-	return &Storer{rdb: testRdb}
+	return taskqueue.NewStorer(testRdb)
 }
 
 // newTestTask is a test helper that returns a new testing Task.
-func newTestTask(typename string, payload []byte) *Task {
-	return &Task{
-		taskInfo: taskInfo{
-			id:     uuid.New(),
-			status: StatusWaiting,
-		},
-		taskSpec: taskSpec{
-			Typename: typename,
-			Payload:  payload,
-		},
+func newTestTask(typename string, payload []byte) *taskqueue.Task {
+	task, err := taskqueue.NewTask(typename, payload)
+	if err != nil {
+		panic("newTestTask: " + err.Error())
 	}
+	return task
 }
 
 func TestStorer_Enqueue(t *testing.T) {
@@ -66,8 +42,8 @@ func TestStorer_Enqueue(t *testing.T) {
 			t.Fatalf("Enqueue() error = %v", err)
 		}
 
-		// 验证队列长度
-		length, err := testRdb.LLen(ctx, prefixKeyQueue).Result()
+		// Check the queue length in Redis.
+		length, err := testRdb.LLen(ctx, "taskqueue:queue").Result()
 		if err != nil {
 			t.Fatalf("LLen error = %v", err)
 		}
@@ -75,8 +51,8 @@ func TestStorer_Enqueue(t *testing.T) {
 			t.Errorf("queue length = %d, want 1", length)
 		}
 
-		// 验证 hash 中存在这个 task 的 key
-		exists, err := testRdb.Exists(ctx, prefixKeyTask+task.id.String()).Result()
+		// Check the hash for this task exists in Redis.
+		exists, err := testRdb.Exists(ctx, "taskqueue:task"+task.ID().String()).Result()
 		if err != nil {
 			t.Fatalf("Exists error = %v", err)
 		}
@@ -84,7 +60,6 @@ func TestStorer_Enqueue(t *testing.T) {
 			t.Errorf("task key not found in Redis")
 		}
 	})
-
 }
 
 func TestStorer_Dequeue(t *testing.T) {
@@ -92,7 +67,7 @@ func TestStorer_Dequeue(t *testing.T) {
 
 	t.Run("dequeue from empty queue returns redis.Nil", func(t *testing.T) {
 		s := setupStorer(t)
-		var task Task
+		var task taskqueue.Task
 		id, err := s.Dequeue(ctx, &task)
 		if !errors.Is(err, redis.Nil) {
 			t.Errorf("expected redis.Nil, got %v", err)
@@ -112,36 +87,36 @@ func TestStorer_Dequeue(t *testing.T) {
 		}
 
 		// Dequeue
-		var dequeued Task
+		var dequeued taskqueue.Task
 		id, err := s.Dequeue(ctx, &dequeued)
 		if err != nil {
 			t.Fatalf("Dequeue() error = %v", err)
 		}
-		if id != original.id {
-			t.Errorf("dequeued id = %v, want %v", id, original.id)
+		if id != original.ID() {
+			t.Errorf("dequeued id = %v, want %v", id, original.ID())
 		}
-		if dequeued.id != original.id {
-			t.Errorf("task.id = %v, want %v", dequeued.id, original.id)
+		if dequeued.ID() != original.ID() {
+			t.Errorf("task.id = %v, want %v", dequeued.ID(), original.ID())
 		}
 
-		// 队列应该为空
-		length, _ := testRdb.LLen(ctx, prefixKeyQueue).Result()
+		// The queue should be empty now.
+		length, _ := testRdb.LLen(ctx, "taskqueue:queue").Result()
 		if length != 0 {
 			t.Errorf("queue length after dequeue = %d, want 0", length)
 		}
 
-		// 验证 status 已被 Dequeue 设为 completed
-		if dequeued.status != StatusCompleted {
-			t.Errorf("status = %v, want %v", dequeued.status, StatusCompleted)
+		// Dequeue should have set the status to completed.
+		if dequeued.Status() != taskqueue.StatusCompleted {
+			t.Errorf("status = %v, want %v", dequeued.Status(), taskqueue.StatusCompleted)
 		}
 
-		// 验证 Redis 里的 status 也更新了
-		redisStatus, _ := testRdb.HGet(ctx, prefixKeyTask+original.id.String(), "status").Int()
-		if TaskStatus(redisStatus) != StatusCompleted {
-			t.Errorf("Redis status = %v, want %v", TaskStatus(redisStatus), StatusCompleted)
+		// The status in Redis should also be updated.
+		redisStatus, _ := testRdb.HGet(ctx, "taskqueue:task"+original.ID().String(), "status").Int()
+		if taskqueue.TaskStatus(redisStatus) != taskqueue.StatusCompleted {
+			t.Errorf("Redis status = %v, want %v", taskqueue.TaskStatus(redisStatus), taskqueue.StatusCompleted)
 		}
 
-		// 验证 taskSpec 数据完整往返
+		// The task spec should survive the round trip intact.
 		if dequeued.Typename != "sms" {
 			t.Errorf("typename = %q, want %q", dequeued.Typename, "sms")
 		}
@@ -149,33 +124,33 @@ func TestStorer_Dequeue(t *testing.T) {
 			t.Errorf("payload = %q, want %q", string(dequeued.Payload), `{"phone":"123"}`)
 		}
 
-		// 验证 createdAt 在合理范围内
+		// CreatedAt should be in a reasonable range.
 		now := time.Now()
-		if dequeued.createdAt.After(now) {
-			t.Errorf("createdAt %v is in the future", dequeued.createdAt)
+		if dequeued.CreatedAt().After(now) {
+			t.Errorf("createdAt %v is in the future", dequeued.CreatedAt())
 		}
-		if now.Sub(dequeued.createdAt) > 10*time.Second {
-			t.Errorf("createdAt %v is too old", dequeued.createdAt)
+		if now.Sub(dequeued.CreatedAt()) > 10*time.Second {
+			t.Errorf("createdAt %v is too old", dequeued.CreatedAt())
 		}
 	})
 
 	t.Run("FIFO order: first in, first out", func(t *testing.T) {
 		s := setupStorer(t)
-		tasks := []*Task{
+		tasks := []*taskqueue.Task{
 			newTestTask("type-a", []byte("a")),
 			newTestTask("type-b", []byte("b")),
 			newTestTask("type-c", []byte("c")),
 		}
-		// LPush 到队列，所以出队顺序和入队顺序相反（stack 行为）
-		// 除非用 LPop 出队...等一下，Dequeue 用的是 RPop
-		// LPush + RPop = FIFO
+		// Enqueue uses LPush and Dequeue uses RPop, so together they give FIFO order.
 		for _, task := range tasks {
-			s.Enqueue(ctx, task)
+			if err := s.Enqueue(ctx, task); err != nil {
+				t.Errorf("failed to euqueue task: %v", err)
+			}
 		}
 
 		var dequeued []uuid.UUID
 		for range tasks {
-			var t2 Task
+			var t2 taskqueue.Task
 			id, err := s.Dequeue(ctx, &t2)
 			if err != nil {
 				t.Fatalf("Dequeue() error = %v", err)
@@ -183,10 +158,10 @@ func TestStorer_Dequeue(t *testing.T) {
 			dequeued = append(dequeued, id)
 		}
 
-		// FIFO: 第一个入队的应该第一个出队
+		// FIFO: the first task enqueued should be the first one dequeued.
 		for i, task := range tasks {
-			if dequeued[i] != task.id {
-				t.Errorf("position %d: got %s, want %s", i, dequeued[i], task.id)
+			if dequeued[i] != task.ID() {
+				t.Errorf("position %d: got %s, want %s", i, dequeued[i], task.ID())
 			}
 		}
 	})

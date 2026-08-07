@@ -11,9 +11,15 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Storer ...
+// Storer is the Redis-backed persistence layer for tasks.  It stores task
+// state as hashes and manages the FIFO queue (task's id) used by consumers to
+// pull the next task.
 type Storer struct {
 	rdb redis.UniversalClient
+}
+
+func NewStorer(rdb redis.UniversalClient) *Storer {
+	return &Storer{rdb: rdb}
 }
 
 const (
@@ -63,7 +69,7 @@ func (s *Storer) Dequeue(ctx context.Context, t *Task) (taskID uuid.UUID, err er
 
 	key := prefixKeyTask + taskID.String() // taskqueue:task:<id>
 
-	// 一次 pipeline：读完数据的同时把 status 设为 completed
+	// Read all hash fields and mark the status as completed in one pipeline.
 	pipe := s.rdb.Pipeline()
 	hgetallCmd := pipe.HGetAll(ctx, key)
 	pipe.HSet(ctx, key, "status", int(StatusCompleted))
