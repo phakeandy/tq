@@ -131,9 +131,12 @@ func (c *Consumer) Shutdown(ctx context.Context) error {
 	panic("TODO")
 }
 
-// Start launches concurrency worker goroutines that block on Dequeue and
-// dispatch each task to its registered handler. It blocks until ctx is
-// cancelled or Shutdown is called. Call Shutdown to stop.
+// Start launches the main loop of Consumer.
+// It starts concurrency worker goroutines that block on Dequeue and dispatch
+// each task to its registered handler.
+//
+// It blocks until ctx is cancelled or Shutdown is called. Call Shutdown to
+// stop.
 func (c *Consumer) Start(ctx context.Context) error {
 	panic("TODO")
 }

@@ -61,8 +61,13 @@ func TestNewTask(t *testing.T) {
 
 func TestConsumer_Start(t *testing.T) {
 	s := taskqueue.NewStorer(testRdb)
-	_, err := taskqueue.NewConsumer(s, 10)
+	c, err := taskqueue.NewConsumer(s, 10)
 	if err != nil {
 		t.Errorf("new consumer fail %v", err)
 	}
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Errorf("start consumer fail %v", err)
+	}
+
 }
