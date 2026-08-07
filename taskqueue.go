@@ -1,7 +1,6 @@
 package taskqueue
 
 import (
-	"errors"
 	"fmt"
 	"time"
 
@@ -63,48 +62,57 @@ var _ fmt.Stringer = StatusWaiting
 type Consumer struct{}
 type Producer struct{}
 
-// Options keeps the settings to build a new Task.
-type Options struct {
-	// TaskType identifies which Worker handles this task (maps to RegisterHandler key). Required.
-	TaskType string
+// Option configures a Task created by NewTask. Options are applied in order,
+// so a later option overrides an earlier one.
+type Option func(*options)
 
-	// Payload carries opaque business data. The engine does not interpret it. Required.
-	Payload []byte
-
-	// MaxRetries is the maximum number of retries on failure. nil means use default (3).
-	// TODO(F4): retry logic not yet implemented; field is reserved.
-	MaxRetries *int
-
-	// IdempotencyKey ensures tasks with the same key execute at most once. Empty string disables it.
-	// TODO(F5): idempotent delivery not yet implemented; field is reserved.
-	IdempotencyKey string
-
-	// Delay postpones execution by this duration. Zero means immediate execution.
-	// TODO(F3): delayed execution not yet implemented; field is reserved.
-	Delay time.Duration
-
-	// Timeout is the maximum allowed duration for a single execution attempt. Zero means default (30s).
-	// TODO(F8): ctx is already passed to handler, but handlers ignoring ctx are not forcibly aborted.
-	Timeout time.Duration
+// options holds the tunable settings of a Task.
+type options struct {
+	maxRetries     int
+	idempotencyKey string
+	delay          time.Duration
+	timeout        time.Duration
 }
 
-// NewTask returns a new Task with default value.
-// It check weather value from opts are illegal.
-func NewTask(opts Options) (t *Task, err error) {
-	if opts.TaskType == "" {
-		return nil, errors.New("task type is required")
-	}
-	if len(opts.Payload) == 0 || string(opts.Payload) == "null" {
-		return nil, errors.New("payload is required")
-	}
+// WithMaxRetries sets the maximum number of retries on failure.
+// Not calling it uses the default (3). 0 means no retries at all.
+// TODO(F4): retry logic not yet implemented; field is reserved.
+func WithMaxRetries(n int) Option {
+	return func(o *options) { o.maxRetries = n }
+}
 
-	maxRetries := 3
-	if opts.MaxRetries != nil {
-		maxRetries = *opts.MaxRetries
+// WithIdempotencyKey ensures tasks with the same key execute at most once.
+// Empty string disables it.
+// TODO(F5): idempotent delivery not yet implemented; field is reserved.
+func WithIdempotencyKey(k string) Option {
+	return func(o *options) { o.idempotencyKey = k }
+}
+
+// WithDelay postpones execution by this duration. Zero means immediate execution.
+// TODO(F3): delayed execution not yet implemented; field is reserved.
+func WithDelay(d time.Duration) Option {
+	return func(o *options) { o.delay = d }
+}
+
+// WithTimeout sets the maximum allowed duration for a single execution attempt.
+// Not calling it uses the default (30s). 0 means no timeout.
+// TODO(F8): ctx is already passed to handler, but handlers ignoring ctx are not forcibly aborted.
+func WithTimeout(d time.Duration) Option {
+	return func(o *options) { o.timeout = d }
+}
+
+// NewTask returns a new Task with default values.
+// It checks whether the arguments are legal.
+//
+// taskType and payload are required; everything else is optional and can be
+// configured with the With* options above.
+func NewTask(taskType string, payload []byte, opts ...Option) (*Task, error) {
+	o := options{
+		maxRetries: 3,
+		timeout:    30 * time.Second,
 	}
-	timeout := 30 * time.Second
-	if opts.Timeout != 0 {
-		timeout = opts.Timeout
+	for _, opt := range opts {
+		opt(&o)
 	}
 
 	info := &taskInfo{
@@ -113,16 +121,15 @@ func NewTask(opts Options) (t *Task, err error) {
 		createdAt: time.Now(),
 	}
 
-	t := &Task{
+	return &Task{
 		taskInfo: *info,
 		taskSpec: taskSpec{
-			Typename:       opts.TaskType,
-			Payload:        opts.Payload,
-			MaxRetries:     maxRetries,
-			IdempotencyKey: opts.IdempotencyKey,
-			Delay:          opts.Delay,
-			Timeout:        timeout,
+			Typename:       taskType,
+			Payload:        payload,
+			MaxRetries:     o.maxRetries,
+			IdempotencyKey: o.idempotencyKey,
+			Delay:          o.delay,
+			Timeout:        o.timeout,
 		},
-	}
-	return t, nil
+	}, nil
 }
