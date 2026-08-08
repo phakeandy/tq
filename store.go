@@ -3,23 +3,21 @@ package taskqueue
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
-// Storer is the Redis-backed persistence layer for tasks.  It stores task
+// RedisStore is the Redis-backed persistence layer for tasks.  It stores task
 // state as hashes and manages the FIFO queue (task's id) used by consumers to
 // pull the next task.
-type Storer struct {
+type RedisStore struct {
 	rdb redis.UniversalClient
 }
 
-func NewStorer(rdb redis.UniversalClient) *Storer {
-	return &Storer{rdb: rdb}
+func NewRedisStore(rdb redis.UniversalClient) *RedisStore {
+	return &RedisStore{rdb: rdb}
 }
 
 const (
@@ -31,7 +29,7 @@ const (
 // It sets the task's status to waiting and records the creation time.
 // The task ID is pushed onto the queue atomically with the state.
 // It returns an error if the operation fails.
-func (s *Storer) Enqueue(ctx context.Context, t *Task) error {
+func (s *RedisStore) Enqueue(ctx context.Context, t *Task) error {
 	key := prefixKeyTask + t.id.String() // taskqueue:task:<id>
 	specJSON, err := json.Marshal(t.taskSpec)
 	if err != nil {
@@ -53,13 +51,10 @@ func (s *Storer) Enqueue(ctx context.Context, t *Task) error {
 	return nil
 }
 
-// Dequeue removes t from the task queue and set its status to completed.
-func (s *Storer) Dequeue(ctx context.Context, t *Task) (taskID uuid.UUID, err error) {
-	idString, err := s.rdb.RPop(ctx, prefixKeyQueue).Result()
+// Dequeue removes t from the task queue.
+func (s *RedisStore) Dequeue(ctx context.Context, t *Task) (taskID uuid.UUID, err error) {
+	idString, err := s.rdb.BRPop(ctx, prefixKeyQueue).Result()
 	if err != nil {
-		if errors.Is(err, redis.Nil) {
-			return uuid.Nil, fmt.Errorf("task queue is empty: %w", err)
-		}
 		return uuid.Nil, err
 	}
 	taskID, err = uuid.Parse(idString)
@@ -72,7 +67,6 @@ func (s *Storer) Dequeue(ctx context.Context, t *Task) (taskID uuid.UUID, err er
 	// Read all hash fields and mark the status as completed in one pipeline.
 	pipe := s.rdb.Pipeline()
 	hgetallCmd := pipe.HGetAll(ctx, key)
-	pipe.HSet(ctx, key, "status", int(StatusCompleted))
 	if _, err := pipe.Exec(ctx); err != nil {
 		return uuid.Nil, err
 	}
@@ -87,11 +81,16 @@ func (s *Storer) Dequeue(ctx context.Context, t *Task) (taskID uuid.UUID, err er
 	}
 
 	t.id = taskID
-	t.status = StatusCompleted
 	t.createdAt = time.UnixMilli(r.CreatedAt)
 	if err := json.Unmarshal([]byte(r.Spec), &t.taskSpec); err != nil {
 		return uuid.Nil, err
 	}
 
 	return taskID, nil
+}
+
+// UpdateStatus sets status of the task with taskID.
+func (s *RedisStore) UpdateStatus(ctx context.Context, taskID uuid.UUID, status TaskStatus) error {
+	key := prefixKeyTask + taskID.String()
+	return s.rdb.HSet(ctx, key, "status", int(status)).Err()
 }

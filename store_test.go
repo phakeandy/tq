@@ -12,12 +12,12 @@ import (
 	taskqueue "github.com/phakeandy/task-queue"
 )
 
-func setupStorer(t *testing.T) *taskqueue.Storer {
+func setupStorer(t *testing.T) *taskqueue.RedisStore {
 	t.Helper()
 	if err := testRdb.FlushDB(context.Background()).Err(); err != nil {
 		t.Fatalf("FlushDB failed: %v", err)
 	}
-	return taskqueue.NewStorer(testRdb)
+	return taskqueue.NewRedisStore(testRdb)
 }
 
 // newTestTask is a test helper that returns a new testing Task.

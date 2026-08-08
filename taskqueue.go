@@ -76,6 +76,21 @@ func (s TaskStatus) String() string {
 
 var _ fmt.Stringer = StatusWaiting
 
+// Storer is the storage contract for task persistence and queueing.
+type Storer interface {
+	// Enqueue adds t to the task queue and stores its initial state.
+	Enqueue(ctx context.Context, t *Task) error
+
+	// Dequeue atomically removes the next task from the queue and loads
+	// its data into t.  It blocks until a task is available or ctx is
+	// cancelled.  The returned uuid.UUID is the task's ID.
+	Dequeue(ctx context.Context, t *Task) (uuid.UUID, error)
+
+	// updateStatus persists the given status for the task identified by
+	// taskID.  It is idempotent and safe for concurrent use.
+	updateStatus(ctx context.Context, taskID uuid.UUID, status TaskStatus) error
+}
+
 // Consumer pulls tasks from the queue and executes registered handlers.
 // It runs concurrency worker goroutines, each blocking on Dequeue, then
 // dispatching to the handler matched by task type.
@@ -84,7 +99,7 @@ var _ fmt.Stringer = StatusWaiting
 // Call Shutdown for graceful stop: it stops accepting new tasks and waits
 // for in-flight handlers to finish.
 type Consumer struct {
-	s *Storer
+	s Storer
 
 	handlers   map[string]Handler
 	handlersMu sync.Mutex
@@ -99,7 +114,7 @@ type Consumer struct {
 // before calling Start.
 //
 // Return error if arguments is not valid.
-func NewConsumer(s *Storer, concurrency int) (*Consumer, error) {
+func NewConsumer(s Storer, concurrency int) (*Consumer, error) {
 	if s == nil {
 		return nil, fmt.Errorf("storer must not be nil")
 	}
@@ -131,19 +146,61 @@ func (c *Consumer) Shutdown(ctx context.Context) error {
 	panic("TODO")
 }
 
-// Start launches the main loop of Consumer.
-// It starts concurrency worker goroutines that block on Dequeue and dispatch
+// Run launches the main loop of Consumer.
+// It spawms concurrency worker goroutines that block on Dequeue and dispatch
 // each task to its registered handler.
 //
 // It blocks until ctx is cancelled or Shutdown is called. Call Shutdown to
 // stop.
-func (c *Consumer) Start(ctx context.Context) error {
-	panic("TODO")
+func (c *Consumer) Run(ctx context.Context) error {
+	c.wg.Add(c.concurrency)
+	for i := 0; i < c.concurrency; i++ {
+		go func() {
+			defer c.wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-c.quit:
+					return
+				default:
+				}
+				var t Task
+				taskID, err := c.s.Dequeue(ctx, &t)
+				if err != nil {
+					continue
+				}
+				// TODO: change dequeue atomically update status to running, if failed, enqueue again
+				// if err := c.UpdateStatus(ctx, taskID, StatusRunning); err != nil {
+				// 	// retry
+				// 	continue
+				// }
+
+				c.handlersMu.RLock()
+				handler, ok := c.handlers[task.Typename]
+				c.handlersMu.RUnlock()
+				if !ok {
+					// TODO: add retry
+					_ = c.s.updateStatus(ctx, taskID, StatusFailed)
+					continue
+				}
+
+				if err := handler(ctx, &t); err != nil {
+					// TODO: add retry
+					_ = c.s.updateStatus(ctx, taskID, StatusFailed)
+				} else {
+					// TODO: add retry
+					_ = c.s.updateStatus(ctx, taskID, StatusCompleted)
+				}
+			}
+		}()
+	}
+	c.wg.Wait()
 }
 
 // Producer TODO
 type Producer struct {
-	s  *Storer
+	s  Storer
 	mu sync.Mutex
 }
 
