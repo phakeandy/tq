@@ -208,8 +208,8 @@ func (p *Producer) Produce(ctx context.Context, t *Task) error {
 	panic("TODO")
 }
 
-// Option configures a Task created by NewTask. Options are applied in order,
-// so a later option overrides an earlier one.
+// Option configures a Task created by NewTask.  A later option overrides an
+// earlier one.
 type Option func(*options)
 
 // options holds the tunable settings of a Task.
