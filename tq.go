@@ -11,10 +11,23 @@ import (
 
 // Task represents a unit of work to be performed.
 type Task struct {
-	// Type indicates the type of task to be performed.
-	Type string
-	// Payload holds data needed to perform the task.
-	Payload  []byte
+	// typ indicates the type of task to be performed.
+	typ string
+
+	// payload holds data needed to perform the task.
+	payload []byte
+
+	// opts is the task's config.
+	opts []Option
+}
+
+// NewTask creates a Task with the given options applied.
+func NewTask(typ string, payload string, opts ...Option) *Task {
+	return &Task{
+		typ:     typ,
+		payload: payload,
+		opts:    opts,
+	}
 }
 
 type TaskStatus int
@@ -52,7 +65,7 @@ type Broker struct {
 func (b *Broker) enqueue(ctx context.Context, t *Task) error {
 	panic("TODO")
 }
-func (b *Broker) dequeue(ctx context.Context) (*Task, error) {
+func (b *Broker) dequeue(ctx context.Context) (id uuid.UUID, err error) {
 	panic("TODO")
 }
 func (b *Broker) markAsCompleted(ctx context.Context, id uuid.UUID) error {
@@ -103,15 +116,8 @@ func WithTimeout(d time.Duration) Option {
 
 type Handle func(ctx context.Context, t *Task) error
 
-type HandleMap map[string]Handle
+type H map[string]Handle
 
-func Run(ctx context.Context, h map[string]Handle, opts ...Option) error {
-	panic("TODO")
-}
-
-// Shutdown gracefully stops all worker goroutines. It closes the quit channel
-// to signal workers to stop pulling new tasks, then waits for in-flight
-// handlers to finish via WaitGroup. Returns when all workers have exited.
-func Shutdown(ctx context.Context) error {
-	panic("TODO")
+func Run(ctx context.Context, broker Broker, handlemap H, concurrency int) error {
+	// TODO
 }

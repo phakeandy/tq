@@ -10,9 +10,10 @@ import (
 )
 
 func TestRun(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	sendTask := func(ctx context.Context, task *tq.Task) error {
+	sendEmail := func(ctx context.Context, task *tq.Task) error {
 		var p struct {
 			From string `json:"from"`
 			To   string `json:"to"`
@@ -20,15 +21,15 @@ func TestRun(t *testing.T) {
 		if err := json.Unmarshal(task.Payload, &p); err != nil {
 			return err
 		}
-		fmt.Printf("From: %v, to: %v\n", p.From, p.To)
+		fmt.Printf("Send a email from: %v, to: %v\n", p.From, p.To)
 		return nil
 	}
 
-	h := tq.HandleMap{
-		"email:send": sendTask,
+	h := tq.H{
+		"email:send": sendEmail,
 	}
 
-	err := tq.Run(ctx, h)
+	err := go tq.Run(ctx, h)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
