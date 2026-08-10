@@ -6,11 +6,28 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/redis/go-redis"
+	"github.com/redis/go-redis/v9"
 )
 
 // defaultQueueName is the name of the queue this broker serves.
 const defaultQueueName = "default"
+
+// Job is a live task: the runtime instance created when a task is enqueued.
+// A worker receives a Job and reads the task definition (Type, Payload) plus
+// its runtime identity (ID).
+//
+// status and qname are broker-managed and not part of the public contract.
+type Job struct {
+	ID      uuid.UUID
+	Type    string
+	Payload []byte
+
+	status string
+	qname  string
+}
+
+// Key returns the redis hash key under which this job's data is stored.
+func (j Job) Key() string { return fmt.Sprintf(keyJob, j.qname, j.ID) }
 
 const (
 	keyJob             = "tq:{%s}:job:%s"        // qname, id  Hash
@@ -19,8 +36,6 @@ const (
 	keyStatusCompleted = "tq:{%s}:job:completed" // qname      ZSet, score = completedAt
 	keyStatusFailed    = "tq:{%s}:job:failed"    // qname      ZSet, score = failedAt
 )
-
-func jobKey(qname string, id uuid.UUID) string { return fmt.Sprintf(keyJob, qname, id) }
 
 func pendingKey(qname string) string   { return fmt.Sprintf(keyStatusPending, qname) }
 func runningKey(qname string) string   { return fmt.Sprintf(keyStatusRunning, qname) }
@@ -35,9 +50,14 @@ type RDB struct {
 	client redis.UniversalClient
 }
 
+func NewRDB(client redis.UniversalClient) *RDB{
+	return &RDB{client: client}
+}
+
 // enqueue adds the given task to the pending list of the queue.
 func (r *RDB) enqueue(ctx context.Context, qname string, t *Task) error {
-	id := uuid.New()
+	// id := uuid.New()
+	panic("TODO")
 
 	// // Store the task data and push its id onto the pending queue in one
 	// // pipeline so a partially written task is never visible to dequeuers.
@@ -52,16 +72,9 @@ func (r *RDB) enqueue(ctx context.Context, qname string, t *Task) error {
 	// return err
 }
 
-type job struct {
-	id      uuid.UUID
-	payload []byte
-	status  string
-	qname   string
-}
-
 // dequeue blocks until a job is available, atomically moving it from the
 // pending queue to the running queue, and returns it.
-func (r *RDB) dequeue(ctx context.Context, qname string) (*job, error) {
+func (r *RDB) dequeue(ctx context.Context, qname string) (*Job, error) {
 	// TODO: use lua script
 	// idStr, err := b.BLMove(
 	// 	ctx,
@@ -84,16 +97,17 @@ func (r *RDB) dequeue(ctx context.Context, qname string) (*job, error) {
 	// 	return nil, err
 	// }
 
-	return &job{id: id, payload: payload, status: StatusRunning.String()}, nil
+	panic("TODO")
+	// return &Job{ID: id, Payload: payload, status: StatusRunning.String()}, nil
 }
-func (r *RDB) markAsCompleted(ctx context.Context, job *job) error {
+func (r *RDB) markAsCompleted(ctx context.Context, job *Job) error {
 	script := redis.NewScript(`
 local running_queue    = KEYS[1]
 local completed_queue  = KEYS[2]
 local job_key          = KEYS[3]
 
-local job_id = ARGS[1]
-local job_exp_time = ARGS[2] -- job expiration time in unix time
+local job_id        = ARGV[1]
+local job_exp_time  = ARGV[2] -- job expiration time in unix time
 
 if redis.call("LREM", running_queue, 0, job_id) == 0 then
   return redis.error_reply("NOT FOUND")
@@ -108,16 +122,17 @@ return "OK"
 	keys := []string{
 		runningKey(job.qname),
 		completedKey(job.qname),
-		jobKey(job.qname),
+		job.Key(),
 	}
 	args := []interface{}{
-		job.id,
-		time.Now().Add(statsTTL),
+		job.ID.String(),
+		time.Now().Add(statsTTL).Unix(),
 	}
-	script.Run(ctx, r, keys, args...)
-	if err != nil {
-		fmt.Println(err)
+	cmd := script.Run(ctx, r.client, keys, args...)
+	if cmd.Err() != nil {
+		fmt.Println(cmd.Err())
 	}
+	return nil
 }
 
 func (r *RDB) markAsFailed(ctx context.Context, id uuid.UUID, reason string) error {

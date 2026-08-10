@@ -5,9 +5,6 @@ import (
 	"fmt"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
 )
 
 // Task represents a unit of work to be performed.
@@ -58,6 +55,10 @@ func (s Status) String() string {
 
 var _ fmt.Stringer = StatusPending
 
+// Option configures a Task created by NewTask.  A later option overrides an
+// earlier one.
+type Option func(*options)
+
 // options holds the tunable settings of a Task.
 type options struct {
 	maxRetries     int
@@ -93,7 +94,9 @@ func WithTimeout(d time.Duration) Option {
 	return func(o *options) { o.timeout = d }
 }
 
-type Handle func(ctx context.Context, t *Task) error
+// Handle executes a single dequeued job. Returning nil marks the job
+// completed; returning an error marks it failed.
+type Handle func(ctx context.Context, j *Job) error
 
 type H map[string]Handle
 
@@ -102,7 +105,7 @@ type H map[string]Handle
 // each task to its registered handler.
 //
 // It blocks until ctx is cancelled.
-func Run(ctx context.Context, broker Broker, handlemap H, concurrency int) error {
+func Run(ctx context.Context, rdb *RDB, handlemap H, concurrency int) error {
 	if concurrency <= 0 {
 		return fmt.Errorf("concurrency must be positive, got %d", concurrency)
 	}
@@ -121,23 +124,23 @@ func Run(ctx context.Context, broker Broker, handlemap H, concurrency int) error
 					return
 				default:
 				}
-				job, err := broker.dequeue(ctx)
+				job, err := rdb.dequeue(ctx, defaultQueueName)
 				if err != nil {
 					continue
 				}
 
-				handler, ok := handlemap[job.typ]
+				handler, ok := handlemap[job.Type]
 				if !ok {
 					// TODO: add retry
-					_ = broker.markAsFailed(ctx, job.id, "no handler for task type")
+					_ = rdb.markAsFailed(ctx, job.ID, "no handler for task type")
 					continue
 				}
 
 				if err := handler(ctx, job); err != nil {
 					// TODO: add retry
-					_ = broker.markAsFailed(ctx, job.id, err.Error())
+					_ = rdb.markAsFailed(ctx, job.ID, err.Error())
 				} else {
-					_ = broker.markAsCompleted(ctx, job.id)
+					_ = rdb.markAsCompleted(ctx, job)
 				}
 			}
 		}()
