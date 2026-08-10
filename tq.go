@@ -3,6 +3,7 @@ package tq
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,7 +23,7 @@ type Task struct {
 }
 
 // NewTask creates a Task with the given options applied.
-func NewTask(typ string, payload string, opts ...Option) *Task {
+func NewTask(typ string, payload []byte, opts ...Option) *Task {
 	return &Task{
 		typ:     typ,
 		payload: payload,
@@ -30,17 +31,17 @@ func NewTask(typ string, payload string, opts ...Option) *Task {
 	}
 }
 
-type TaskStatus int
+type Status int
 
 const (
-	StatusPending TaskStatus = iota
+	StatusPending Status = iota
 	StatusRunning
 	StatusCompleted
 	StatusFailed
 )
 
-// String returns the string representation of the task status.
-func (s TaskStatus) String() string {
+// String returns the string representation of the status.
+func (s Status) String() string {
 	switch s {
 	case StatusPending:
 		return "pending"
@@ -56,28 +57,6 @@ func (s TaskStatus) String() string {
 }
 
 var _ fmt.Stringer = StatusPending
-
-// Broker wraps a redis client and implements the task persistence layer.
-type Broker struct {
-	client redis.UniversalClient
-}
-
-func (b *Broker) enqueue(ctx context.Context, t *Task) error {
-	panic("TODO")
-}
-func (b *Broker) dequeue(ctx context.Context) (id uuid.UUID, err error) {
-	panic("TODO")
-}
-func (b *Broker) markAsCompleted(ctx context.Context, id uuid.UUID) error {
-	panic("TODO")
-}
-func (b *Broker) markAsFailed(ctx context.Context, id uuid.UUID, reason string) error {
-	panic("TODO")
-}
-
-// Option configures a Task created by NewTask.  A later option overrides an
-// earlier one.
-type Option func(*options)
 
 // options holds the tunable settings of a Task.
 type options struct {
@@ -118,6 +97,51 @@ type Handle func(ctx context.Context, t *Task) error
 
 type H map[string]Handle
 
+// Run launches the main loop of the queue.
+// It spawns concurrency worker goroutines that block on dequeue and dispatch
+// each task to its registered handler.
+//
+// It blocks until ctx is cancelled.
 func Run(ctx context.Context, broker Broker, handlemap H, concurrency int) error {
-	// TODO
+	if concurrency <= 0 {
+		return fmt.Errorf("concurrency must be positive, got %d", concurrency)
+	}
+	if handlemap == nil {
+		return fmt.Errorf("handlemap must not be nil")
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				job, err := broker.dequeue(ctx)
+				if err != nil {
+					continue
+				}
+
+				handler, ok := handlemap[job.typ]
+				if !ok {
+					// TODO: add retry
+					_ = broker.markAsFailed(ctx, job.id, "no handler for task type")
+					continue
+				}
+
+				if err := handler(ctx, job); err != nil {
+					// TODO: add retry
+					_ = broker.markAsFailed(ctx, job.id, err.Error())
+				} else {
+					_ = broker.markAsCompleted(ctx, job.id)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return nil
 }
