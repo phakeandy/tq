@@ -132,13 +132,13 @@ func Run(ctx context.Context, rdb *RDB, handlemap H, concurrency int) error {
 				handler, ok := handlemap[job.Type]
 				if !ok {
 					// TODO: add retry
-					_ = rdb.markAsFailed(ctx, job.ID, "no handler for task type")
+					_ = rdb.markAsFailed(ctx, job, "no handler for task type")
 					continue
 				}
 
 				if err := handler(ctx, job); err != nil {
 					// TODO: add retry
-					_ = rdb.markAsFailed(ctx, job.ID, err.Error())
+					_ = rdb.markAsFailed(ctx, job, err.Error())
 				} else {
 					_ = rdb.markAsCompleted(ctx, job)
 				}

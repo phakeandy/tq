@@ -50,7 +50,7 @@ type RDB struct {
 	client redis.UniversalClient
 }
 
-func NewRDB(client redis.UniversalClient) *RDB{
+func NewRDB(client redis.UniversalClient) *RDB {
 	return &RDB{client: client}
 }
 
@@ -129,12 +129,45 @@ return "OK"
 		time.Now().Add(statsTTL).Unix(),
 	}
 	cmd := script.Run(ctx, r.client, keys, args...)
-	if cmd.Err() != nil {
-		fmt.Println(cmd.Err())
+	if err := cmd.Err(); err != nil {
+		return err
 	}
 	return nil
 }
 
-func (r *RDB) markAsFailed(ctx context.Context, id uuid.UUID, reason string) error {
-	panic("TODO")
+func (r *RDB) markAsFailed(ctx context.Context, job *Job, reason string) error {
+	script := redis.NewScript(`
+local running_queue = KEYS[1]
+local failed_queue  = KEYS[2]
+local job_key       = KEYS[3]
+
+local job_id        = ARGV[1]
+local job_exp_time  = ARGV[2] -- job expiration time in unix time
+local reason        = ARGV[3]
+
+if redis.call("LREM", running_queue, 0, job_id) == 0 then
+  return redis.error_reply("NOT FOUND")
+end
+if redis.call("ZADD", failed_queue, job_exp_time, job_id) == 0 then
+  return redis.error_reply("NOT FOUND")
+end
+
+redis.call("HSET", job_key, "status", "failed", "error", reason)
+return "OK"
+`)
+	keys := []string{
+		runningKey(job.qname),
+		failedKey(job.qname),
+		job.Key(),
+	}
+	args := []interface{}{
+		job.ID.String(),
+		time.Now().Add(statsTTL).Unix(),
+		reason,
+	}
+	cmd := script.Run(ctx, r.client, keys, args...)
+	if err := cmd.Err(); err != nil {
+		return err
+	}
+	return nil
 }
