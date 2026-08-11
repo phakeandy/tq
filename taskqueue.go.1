@@ -1,0 +1,281 @@
+package taskqueue
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Task representes ...
+type Task struct {
+	taskInfo
+	taskSpec
+}
+
+// ID returns the task's unique identifier.
+func (t *Task) ID() uuid.UUID {
+	return t.id
+}
+
+// Status returns the task's current status.
+func (t *Task) Status() TaskStatus {
+	return t.status
+}
+
+// CreatedAt returns the time the task was created.
+func (t *Task) CreatedAt() time.Time {
+	return t.createdAt
+}
+
+// TaskType holds the runtime infomation of a Task.
+type taskInfo struct {
+	id        uuid.UUID
+	status    TaskStatus
+	createdAt time.Time
+	result    []byte
+}
+
+// TaskSpec holds the user's defination of a Task.
+type taskSpec struct {
+	Typename       string        `json:"typename"`
+	Payload        []byte        `json:"payload"`
+	MaxRetries     int           `json:"max_retries"`
+	IdempotencyKey string        `json:"idempotency_key"`
+	Delay          time.Duration `json:"delay"`
+	Timeout        time.Duration `json:"timeout"`
+}
+
+// TaskStatus representes the Task' status.
+type TaskStatus int
+
+const (
+	StatusWaiting TaskStatus = iota
+	StatusRunning
+	StatusCompleted
+	StatusFailed
+)
+
+// String returns the string representation of the task status.
+func (s TaskStatus) String() string {
+	switch s {
+	case StatusWaiting:
+		return "waiting"
+	case StatusRunning:
+		return "running"
+	case StatusCompleted:
+		return "completed"
+	case StatusFailed:
+		return "failed"
+	default:
+		panic(fmt.Sprintf("ERROR: illegal status number: %d", s))
+	}
+}
+
+var _ fmt.Stringer = StatusWaiting
+
+// Storer is the storage contract for task persistence and queueing.
+type Storer interface {
+	// Enqueue adds t to the task queue and stores its initial state.
+	Enqueue(ctx context.Context, t *Task) error
+
+	// Dequeue atomically removes the next task from the queue and loads
+	// its data into t.  It blocks until a task is available or ctx is
+	// cancelled.  The returned uuid.UUID is the task's ID.
+	Dequeue(ctx context.Context, t *Task) (uuid.UUID, error)
+
+	// updateStatus persists the given status for the task identified by
+	// taskID.  It is idempotent and safe for concurrent use.
+	updateStatus(ctx context.Context, taskID uuid.UUID, status TaskStatus) error
+}
+
+// Consumer pulls tasks from the queue and executes registered handlers.
+// It runs concurrency worker goroutines, each blocking on Dequeue, then
+// dispatching to the handler matched by task type.
+//
+// Handlers must be registered via RegisterHandler before calling Start.
+// Call Shutdown for graceful stop: it stops accepting new tasks and waits
+// for in-flight handlers to finish.
+type Consumer struct {
+	s Storer
+
+	handlers   map[string]Handler
+	handlersMu sync.Mutex
+
+	concurrency int
+	wg          sync.WaitGroup
+	quit        chan struct{}
+}
+
+// NewConsumer creates a Consumer backed by s, ready to run at most concurrency
+// handlers concurrently.  Handlers must be registered via RegisterHandler
+// before calling Start.
+//
+// Return error if arguments is not valid.
+func NewConsumer(s Storer, concurrency int) (*Consumer, error) {
+	if s == nil {
+		return nil, fmt.Errorf("storer must not be nil")
+	}
+	if concurrency <= 0 {
+		return nil, fmt.Errorf("concurrency must be positive, got %d", concurrency)
+	}
+	return &Consumer{
+		s:           s,
+		handlers:    make(map[string]Handler),
+		concurrency: concurrency,
+		quit:        make(chan struct{}),
+	}, nil
+}
+
+type Handler func(ctx context.Context, task *Task) error
+
+// RegisterHandler registers a handler for a given task type.
+// Must be called before Start.
+func (c *Consumer) RegisterHandler(taskType string, h Handler) {
+	c.handlersMu.Lock()
+	defer c.handlersMu.Unlock()
+	c.handlers[taskType] = h
+}
+
+// Shutdown gracefully stops all worker goroutines. It closes the quit channel
+// to signal workers to stop pulling new tasks, then waits for in-flight
+// handlers to finish via WaitGroup. Returns when all workers have exited.
+func (c *Consumer) Shutdown(ctx context.Context) error {
+	panic("TODO")
+}
+
+// Run launches the main loop of Consumer.
+// It spawms concurrency worker goroutines that block on Dequeue and dispatch
+// each task to its registered handler.
+//
+// It blocks until ctx is cancelled or Shutdown is called. Call Shutdown to
+// stop.
+func (c *Consumer) Run(ctx context.Context) error {
+	c.wg.Add(c.concurrency)
+	for i := 0; i < c.concurrency; i++ {
+		go func() {
+			defer c.wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-c.quit:
+					return
+				default:
+				}
+				var t Task
+				taskID, err := c.s.Dequeue(ctx, &t)
+				if err != nil {
+					continue
+				}
+				// TODO: change dequeue atomically update status to running, if failed, enqueue again
+				// if err := c.UpdateStatus(ctx, taskID, StatusRunning); err != nil {
+				// 	// retry
+				// 	continue
+				// }
+
+				c.handlersMu.RLock()
+				handler, ok := c.handlers[task.Typename]
+				c.handlersMu.RUnlock()
+				if !ok {
+					// TODO: add retry
+					_ = c.s.updateStatus(ctx, taskID, StatusFailed)
+					continue
+				}
+
+				if err := handler(ctx, &t); err != nil {
+					// TODO: add retry
+					_ = c.s.updateStatus(ctx, taskID, StatusFailed)
+				} else {
+					// TODO: add retry
+					_ = c.s.updateStatus(ctx, taskID, StatusCompleted)
+				}
+			}
+		}()
+	}
+	c.wg.Wait()
+}
+
+// Producer TODO
+type Producer struct {
+	s  Storer
+	mu sync.Mutex
+}
+
+func (p *Producer) Produce(ctx context.Context, t *Task) error {
+	panic("TODO")
+}
+
+// Option configures a Task created by NewTask.  A later option overrides an
+// earlier one.
+type Option func(*options)
+
+// options holds the tunable settings of a Task.
+type options struct {
+	maxRetries     int
+	idempotencyKey string
+	delay          time.Duration
+	timeout        time.Duration
+}
+
+// WithMaxRetries sets the maximum number of retries on failure.
+// Not calling it uses the default (3). 0 means no retries at all.
+// TODO(F4): retry logic not yet implemented; field is reserved.
+func WithMaxRetries(n int) Option {
+	return func(o *options) { o.maxRetries = n }
+}
+
+// WithIdempotencyKey ensures tasks with the same key execute at most once.
+// Empty string disables it.
+// TODO(F5): idempotent delivery not yet implemented; field is reserved.
+func WithIdempotencyKey(k string) Option {
+	return func(o *options) { o.idempotencyKey = k }
+}
+
+// WithDelay postpones execution by this duration. Zero means immediate execution.
+// TODO(F3): delayed execution not yet implemented; field is reserved.
+func WithDelay(d time.Duration) Option {
+	return func(o *options) { o.delay = d }
+}
+
+// WithTimeout sets the maximum allowed duration for a single execution attempt.
+// Not calling it uses the default (30s). 0 means no timeout.
+// TODO(F8): ctx is already passed to handler, but handlers ignoring ctx are not forcibly aborted.
+func WithTimeout(d time.Duration) Option {
+	return func(o *options) { o.timeout = d }
+}
+
+// NewTask returns a new Task with default values.
+// It checks whether the arguments are legal.
+//
+// taskType and payload are required; everything else is optional and can be
+// configured with the With* options above.
+func NewTask(taskType string, payload []byte, opts ...Option) (*Task, error) {
+	o := options{
+		maxRetries: 3,
+		timeout:    30 * time.Second,
+	}
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	info := &taskInfo{
+		id:        uuid.New(),
+		status:    StatusWaiting,
+		createdAt: time.Now(),
+	}
+
+	return &Task{
+		taskInfo: *info,
+		taskSpec: taskSpec{
+			Typename:       taskType,
+			Payload:        payload,
+			MaxRetries:     o.maxRetries,
+			IdempotencyKey: o.idempotencyKey,
+			Delay:          o.delay,
+			Timeout:        o.timeout,
+		},
+	}, nil
+}
