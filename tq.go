@@ -61,37 +61,37 @@ type Option func(*options)
 
 // options holds the tunable settings of a Task.
 type options struct {
-	maxRetries     int
-	idempotencyKey string
-	delay          time.Duration
-	timeout        time.Duration
+	MaxRetries     int           `json:"max_retries"`
+	IdempotencyKey string        `json:"idempotency_key"`
+	Delay          time.Duration `json:"delay"`
+	Timeout        time.Duration `json:"timeout"`
 }
 
 // WithMaxRetries sets the maximum number of retries on failure.
 // Not calling it uses the default (3). 0 means no retries at all.
 // TODO(F4): retry logic not yet implemented; field is reserved.
 func WithMaxRetries(n int) Option {
-	return func(o *options) { o.maxRetries = n }
+	return func(o *options) { o.MaxRetries = n }
 }
 
 // WithIdempotencyKey ensures tasks with the same key execute at most once.
 // Empty string disables it.
 // TODO(F5): idempotent delivery not yet implemented; field is reserved.
 func WithIdempotencyKey(k string) Option {
-	return func(o *options) { o.idempotencyKey = k }
+	return func(o *options) { o.IdempotencyKey = k }
 }
 
 // WithDelay postpones execution by this duration. Zero means immediate execution.
 // TODO(F3): delayed execution not yet implemented; field is reserved.
 func WithDelay(d time.Duration) Option {
-	return func(o *options) { o.delay = d }
+	return func(o *options) { o.Delay = d }
 }
 
 // WithTimeout sets the maximum allowed duration for a single execution attempt.
 // Not calling it uses the default (30s). 0 means no timeout.
 // TODO(F8): ctx is already passed to handler, but handlers ignoring ctx are not forcibly aborted.
 func WithTimeout(d time.Duration) Option {
-	return func(o *options) { o.timeout = d }
+	return func(o *options) { o.Timeout = d }
 }
 
 // Handle executes a single dequeued job. Returning nil marks the job
@@ -126,6 +126,7 @@ func Run(ctx context.Context, rdb *RDB, handlemap H, concurrency int) error {
 				}
 				job, err := rdb.dequeue(ctx, defaultQueueName)
 				if err != nil {
+					time.Sleep(200 * time.Millisecond)
 					continue
 				}
 
