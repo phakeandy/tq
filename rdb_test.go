@@ -3,185 +3,314 @@ package tq
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/phakeandy/tq/internal/testutil"
 	"github.com/redis/go-redis/v9"
 )
 
-func TestManual_markAsCompleted(t *testing.T) {
-	t.Skip("it is just for debuging.")
+// samplePayload is a small JSON blob used across tests.
+var samplePayload = []byte(`{"from":"a@example.com","to":"b@example.com"}`)
 
+// ──────────────────────────── seed helpers ────────────────────────────
+//
+// These write a job directly into Redis, mimicking what enqueue/dequeue do,
+// so individual operations can be tested in isolation.  They live here (not
+// in testutil) because they need unexported tq symbols.
+
+func seedPendingJob(tb testing.TB, client redis.UniversalClient, job *Job) {
+	tb.Helper()
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	defer client.Close()
-
-	r := NewRDB(client)
-
-	// Fixed id so it is easy to find in redis.
-	jobID := uuid.MustParse("c2f1b4e0-0000-4000-8000-000000000001")
-	job := &Job{
-		JobBody: JobBody{
-			ID:      jobID,
-			Type:    "email:send",
-			Payload: []byte(`{"from":"a@example.com","to":"b@example.com"}`),
-		},
-		qname: defaultQueueName,
-	}
-
-	running := runningKey(job.qname)
-	completed := completedKey(job.qname)
-	jobKey := jobKey(job)
-
-	client.Del(ctx, running, completed, jobKey)
-	client.RPush(ctx, running, jobID.String())
-	client.HSet(ctx, jobKey,
-		"type", job.Type,
-		"payload", string(job.Payload),
-		fieldStatus, StatusRunning.String(),
-	)
-
-	r.markAsCompleted(ctx, job)
-
-}
-
-func TestManual_markAsFailed(t *testing.T) {
-	t.Skip("it is just for debuging.")
-
-	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	defer client.Close()
-
-	r := NewRDB(client)
-
-	// Fixed id so it is easy to find in redis.
-	jobID := uuid.MustParse("c2f1b4e0-0000-4000-8000-000000000002")
-	job := &Job{
-		JobBody: JobBody{
-			ID:      jobID,
-			Type:    "email:send",
-			Payload: []byte(`{"from":"a@example.com","to":"b@example.com"}`),
-		},
-		qname: defaultQueueName,
-	}
-
-	running := runningKey(job.qname)
-	failed := failedKey(job.qname)
-	jobKey := jobKey(job)
-
-	client.Del(ctx, running, failed, jobKey)
-	client.RPush(ctx, running, jobID.String())
-	client.HSet(ctx, jobKey,
-		"type", job.Type,
-		"payload", string(job.Payload),
-		fieldStatus, StatusRunning.String(),
-	)
-
-	r.markAsFailed(ctx, job, "some reason")
-
-}
-
-func TestManual_enqueue(t *testing.T) {
-	// t.Skip("it is just for debuging.")
-
-	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	defer client.Close()
-
-	r := NewRDB(client)
-
-	pending := pendingKey(defaultQueueName)
-	client.Del(ctx, pending)
-
-	task := NewTask("email:send", []byte(`{"from":"a@example.com","to":"b@example.com"}`))
-	if err := r.enqueue(ctx, defaultQueueName, task); err != nil {
-		t.Fatal(err)
-	}
-
-	// Read back what was stored so the effect can be inspected manually.
-	// enqueue generates the job id internally, so find it via the pending queue.
-	ids, err := client.LRange(ctx, pending, 0, -1).Result()
+	body, err := json.Marshal(job.JobBody)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
-	t.Logf("pending queue: %v", ids)
-	for _, id := range ids {
-		fields, err := client.HGetAll(ctx, fmt.Sprintf(keyJob, defaultQueueName, id)).Result()
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Logf("job %s: %v", id, fields)
-	}
-}
-
-func TestManual_dequeue(t *testing.T) {
-	// t.Skip("it is just for debuging.")
-
-	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	defer client.Close()
-
-	r := NewRDB(client)
-
-	// Fixed id so it is easy to find in redis.
-	jobID := uuid.MustParse("c2f1b4e0-0000-4000-8000-000000000003")
-	job := &Job{
-		JobBody: JobBody{
-			ID:      jobID,
-			Type:    "email:send",
-			Payload: []byte(`{"from":"a@example.com","to":"b@example.com"}`),
-		},
-		qname: defaultQueueName,
-	}
-	// Mimic what enqueue writes to the job hash.
-	body, err := json.Marshal(JobBody{
-		ID:      job.ID,
-		Type:    job.Type,
-		Payload: job.Payload,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pending := pendingKey(job.qname)
-	running := runningKey(job.qname)
-	jobKey := jobKey(job)
-
-	client.Del(ctx, pending, running, jobKey)
-	client.LPush(ctx, pending, jobID.String())
-	client.HSet(ctx, jobKey,
+	client.HSet(ctx, jobKey(job),
 		fieldBody, string(body),
 		fieldStatus, StatusPending.String(),
 		fieldPendingSince, time.Now().Unix(),
 	)
-
-	got, err := r.dequeue(ctx, job.qname)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("dequeued job: %+v", got)
-
-	// Read back the resulting state so the effect can be inspected manually.
-	ids, err := client.LRange(ctx, pending, 0, -1).Result()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("pending queue after: %v", ids)
-
-	members, err := client.ZRangeWithScores(ctx, running, 0, -1).Result()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, m := range members {
-		t.Logf("running: %s lease=%v", m.Member, m.Score)
-	}
-
-	fields, err := client.HGetAll(ctx, jobKey).Result()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("job hash after: %v", fields)
+	client.LPush(ctx, pendingKey(job.qname), job.ID.String())
 }
 
+func seedRunningJob(tb testing.TB, client redis.UniversalClient, job *Job) {
+	tb.Helper()
+	ctx := context.Background()
+	body, err := json.Marshal(job.JobBody)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	client.HSet(ctx, jobKey(job),
+		fieldBody, string(body),
+		fieldStatus, StatusRunning.String(),
+	)
+	client.ZAdd(ctx, runningKey(job.qname), redis.Z{
+		Member: job.ID.String(),
+		Score:  float64(time.Now().Add(leaseDuration).Unix()),
+	})
+}
+
+// ──────────────────────────── enqueue ────────────────────────────
+
+func TestEnqueue(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	tests := []struct {
+		desc string
+		task *Task
+	}{
+		{desc: "simple task", task: NewTask("email:send", samplePayload)},
+		{desc: "another task type", task: NewTask("report:generate", []byte(`{}`))},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			testutil.FlushDB(t, client)
+
+			if err := r.enqueue(context.Background(), defaultQueueName, tc.task); err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+
+			// The job ID is generated internally — read it from the pending list.
+			pending := testutil.GetList(t, client, pendingKey(defaultQueueName))
+			if len(pending) != 1 {
+				t.Fatalf("pending list has %d entries, want 1", len(pending))
+			}
+			jobID, err := uuid.Parse(pending[0])
+			if err != nil {
+				t.Fatalf("invalid job ID in pending list: %q", pending[0])
+			}
+
+			job := &Job{JobBody: JobBody{ID: jobID}, qname: defaultQueueName}
+			fields := testutil.GetHash(t, client, jobKey(job))
+
+			if got := fields[fieldStatus]; got != StatusPending.String() {
+				t.Errorf("status = %q, want %q", got, StatusPending.String())
+			}
+
+			var gotBody JobBody
+			if err := json.Unmarshal([]byte(fields[fieldBody]), &gotBody); err != nil {
+				t.Fatalf("unmarshal body: %v", err)
+			}
+			if gotBody.Type != tc.task.typ {
+				t.Errorf("Type = %q, want %q", gotBody.Type, tc.task.typ)
+			}
+			if string(gotBody.Payload) != string(tc.task.payload) {
+				t.Errorf("Payload = %s, want %s", gotBody.Payload, tc.task.payload)
+			}
+		})
+	}
+}
+
+// ──────────────────────────── dequeue ────────────────────────────
+
+func TestDequeue(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	t.Run("moves job from pending to running", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := &Job{
+			JobBody: JobBody{ID: uuid.New(), Type: "email:send", Payload: samplePayload},
+			qname:   defaultQueueName,
+		}
+		seedPendingJob(t, client, job)
+
+		got, err := r.dequeue(context.Background(), defaultQueueName)
+		if err != nil {
+			t.Fatalf("dequeue: %v", err)
+		}
+		if got.ID != job.ID {
+			t.Errorf("ID = %v, want %v", got.ID, job.ID)
+		}
+		if got.Type != job.Type {
+			t.Errorf("Type = %q, want %q", got.Type, job.Type)
+		}
+
+		pending := testutil.GetList(t, client, pendingKey(defaultQueueName))
+		if len(pending) != 0 {
+			t.Errorf("pending list has %d entries after dequeue, want 0", len(pending))
+		}
+
+		running := testutil.GetZSet(t, client, runningKey(defaultQueueName))
+		if len(running) != 1 {
+			t.Fatalf("running zset has %d entries, want 1", len(running))
+		}
+		if running[0].Member != job.ID.String() {
+			t.Errorf("running member = %v, want %v", running[0].Member, job.ID)
+		}
+
+		fields := testutil.GetHash(t, client, jobKey(job))
+		if got := fields[fieldStatus]; got != StatusRunning.String() {
+			t.Errorf("status = %q, want %q", got, StatusRunning.String())
+		}
+	})
+
+	t.Run("empty queue returns error", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		_, err := r.dequeue(context.Background(), defaultQueueName)
+		if err == nil {
+			t.Fatal("expected error on empty queue, got nil")
+		}
+	})
+}
+
+// ──────────────────────────── markAsCompleted ────────────────────────────
+
+func TestMarkAsCompleted(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	t.Run("moves from running to completed", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := &Job{
+			JobBody: JobBody{ID: uuid.New(), Type: "email:send", Payload: samplePayload},
+			qname:   defaultQueueName,
+		}
+		seedRunningJob(t, client, job)
+
+		if err := r.markAsCompleted(context.Background(), job); err != nil {
+			t.Fatalf("markAsCompleted: %v", err)
+		}
+
+		running := testutil.GetZSet(t, client, runningKey(defaultQueueName))
+		if len(running) != 0 {
+			t.Errorf("running zset has %d entries, want 0", len(running))
+		}
+
+		completed := testutil.GetZSet(t, client, completedKey(defaultQueueName))
+		if len(completed) != 1 {
+			t.Fatalf("completed zset has %d entries, want 1", len(completed))
+		}
+		if completed[0].Member != job.ID.String() {
+			t.Errorf("completed member = %v, want %v", completed[0].Member, job.ID)
+		}
+
+		fields := testutil.GetHash(t, client, jobKey(job))
+		if got := fields[fieldStatus]; got != StatusCompleted.String() {
+			t.Errorf("status = %q, want %q", got, StatusCompleted.String())
+		}
+	})
+
+	t.Run("job not in running returns error", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := &Job{
+			JobBody: JobBody{ID: uuid.New(), Type: "email:send", Payload: samplePayload},
+			qname:   defaultQueueName,
+		}
+		err := r.markAsCompleted(context.Background(), job)
+		if err == nil {
+			t.Fatal("expected error when job is not in running, got nil")
+		}
+	})
+}
+
+// ──────────────────────────── markAsFailed ────────────────────────────
+
+func TestMarkAsFailed(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	t.Run("moves from running to failed with reason", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := &Job{
+			JobBody: JobBody{ID: uuid.New(), Type: "email:send", Payload: samplePayload},
+			qname:   defaultQueueName,
+		}
+		seedRunningJob(t, client, job)
+
+		const reason = "smtp timeout"
+		if err := r.markAsFailed(context.Background(), job, reason); err != nil {
+			t.Fatalf("markAsFailed: %v", err)
+		}
+
+		running := testutil.GetZSet(t, client, runningKey(defaultQueueName))
+		if len(running) != 0 {
+			t.Errorf("running zset has %d entries, want 0", len(running))
+		}
+
+		failed := testutil.GetZSet(t, client, failedKey(defaultQueueName))
+		if len(failed) != 1 {
+			t.Fatalf("failed zset has %d entries, want 1", len(failed))
+		}
+		if failed[0].Member != job.ID.String() {
+			t.Errorf("failed member = %v, want %v", failed[0].Member, job.ID)
+		}
+
+		fields := testutil.GetHash(t, client, jobKey(job))
+		if got := fields[fieldStatus]; got != StatusFailed.String() {
+			t.Errorf("status = %q, want %q", got, StatusFailed.String())
+		}
+		if got := fields[fieldError]; got != reason {
+			t.Errorf("error = %q, want %q", got, reason)
+		}
+	})
+
+	t.Run("job not in running returns error", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := &Job{
+			JobBody: JobBody{ID: uuid.New(), Type: "email:send", Payload: samplePayload},
+			qname:   defaultQueueName,
+		}
+		err := r.markAsFailed(context.Background(), job, "reason")
+		if err == nil {
+			t.Fatal("expected error when job is not in running, got nil")
+		}
+	})
+}
+
+// ──────────────────────────── full lifecycle ────────────────────────────
+
+func TestFullLifecycle(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+	ctx := context.Background()
+
+	// 1. Enqueue.
+	task := NewTask("email:send", samplePayload)
+	if err := r.enqueue(ctx, defaultQueueName, task); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// 2. Dequeue.
+	job, err := r.dequeue(ctx, defaultQueueName)
+	if err != nil {
+		t.Fatalf("dequeue: %v", err)
+	}
+	if job.Type != task.typ {
+		t.Errorf("dequeue().Type = %q, want %q", job.Type, task.typ)
+	}
+
+	running := testutil.GetZSet(t, client, runningKey(defaultQueueName))
+	if len(running) != 1 {
+		t.Fatalf("running zset has %d entries, want 1", len(running))
+	}
+
+	// 3. Complete.
+	if err := r.markAsCompleted(ctx, job); err != nil {
+		t.Fatalf("markAsCompleted: %v", err)
+	}
+
+	running = testutil.GetZSet(t, client, runningKey(defaultQueueName))
+	if len(running) != 0 {
+		t.Errorf("running zset has %d entries after complete, want 0", len(running))
+	}
+	completed := testutil.GetZSet(t, client, completedKey(defaultQueueName))
+	if len(completed) != 1 {
+		t.Fatalf("completed zset has %d entries, want 1", len(completed))
+	}
+
+	fields := testutil.GetHash(t, client, jobKey(job))
+	if got := fields[fieldStatus]; got != StatusCompleted.String() {
+		t.Errorf("status = %q, want %q", got, StatusCompleted.String())
+	}
+}
