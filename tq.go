@@ -35,6 +35,8 @@ const (
 	StatusRunning
 	StatusCompleted
 	StatusFailed
+	StatusScheduled
+	StatusRetry
 )
 
 // String returns the string representation of the status.
@@ -48,6 +50,10 @@ func (s Status) String() string {
 		return "completed"
 	case StatusFailed:
 		return "failed"
+	case StatusScheduled:
+		return "scheduled"
+	case StatusRetry:
+		return "retry"
 	default:
 		panic(fmt.Sprintf("ERROR: illegal status number: %d", s))
 	}
