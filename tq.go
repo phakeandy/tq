@@ -73,6 +73,16 @@ type options struct {
 	Timeout        time.Duration `json:"timeout"`
 }
 
+// defaultOptions returns the option values used when the corresponding
+// With* function is not called. It must be applied BEFORE user options so
+// that an explicit zero value (e.g. WithMaxRetries(0)) overrides a default.
+func defaultOptions() options {
+	return options{
+		MaxRetries: 3,
+		Timeout:    30 * time.Second,
+	}
+}
+
 // WithMaxRetries sets the maximum number of retries on failure.
 // Not calling it uses the default (3). 0 means no retries at all.
 // TODO(F4): retry logic not yet implemented; field is reserved.

@@ -105,7 +105,7 @@ redis.call("LPUSH", pending_queue, job_id)
 return 1
 `)
 	jobID := uuid.New()
-	var o options
+	o := defaultOptions()
 	for _, opt := range t.opts {
 		opt(&o)
 	}
