@@ -132,36 +132,75 @@ func Run(ctx context.Context, rdb *RDB, handlemap H, concurrency int) error {
 	var wg sync.WaitGroup
 	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				job, err := rdb.dequeue(ctx, defaultQueueName)
-				if err != nil {
-					time.Sleep(200 * time.Millisecond)
-					continue
-				}
-
-				handler, ok := handlemap[job.Type]
-				if !ok {
-					// TODO: add retry
-					_ = rdb.markAsFailed(ctx, job, "no handler for task type")
-					continue
-				}
-
-				if err := handler(ctx, job); err != nil {
-					// TODO: add retry
-					_ = rdb.markAsFailed(ctx, job, err.Error())
-				} else {
-					_ = rdb.markAsCompleted(ctx, job)
-				}
-			}
-		}()
+		go processJob(ctx, wg, rdb, handlemap)
 	}
 	wg.Wait()
 	return nil
+}
+
+func processJob(ctx context.Context, wg sync.WaitGroup, rdb *RDB, handlemap H) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		job, err := rdb.dequeue(ctx, defaultQueueName) // TODO: now use only defaultQueueName
+		if err != nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		handle, ok := handlemap[job.Type]
+		if !ok {
+			if retryErr := retry(3, func () error {
+				return rdb.markAsFailed(ctx, job, err.Error())
+			}; retryErr !=nil {
+				// no way... only we can do is loging
+			}
+			continue
+		}
+		jobCtx := ctx
+		var cancel context.CancelFunc
+		if job.Opts.Timeout > 0 {
+			jobCtx, cancel = context.WithTimeout(ctx, job.Opts.Timeout)
+		}
+		var handleErr error
+		func () {
+			defer func() {
+				if r := recover(); r != nil {
+					handleErr = fmt.Errorf("panic: %v", r) // panic -> error
+				}
+			}()
+			handleErr = handle(jobCtx, job)
+		}()
+		if cancel != nil {
+			cancel() // release the timer immediately after the handler return (defer cannot be used in a for loop)
+		}
+		if handleErr != nil {
+			if retryErr := retry(3, func () error {
+				return rdb.markAsFailed(ctx, job, err.Error())
+			}; retryErr !=nil {
+				// no way... only we can do is loging
+			}
+		} else {
+			if retryErr := retry(3, func () error {
+				return rdb.markAsCompleted(ctx, job)
+			}; retryErr !=nil {
+				// no way... only we can do is loging
+			}
+		}
+	}
+}
+
+func retry(attempts int, fn func() error) error {
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err == fn(); err = nil {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return err
 }

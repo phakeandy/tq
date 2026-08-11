@@ -51,9 +51,9 @@ const (
 	keyStatusPending   = "tq:{%s}:job:pending"   // qname      List
 	keyStatusRunning   = "tq:{%s}:job:running"   // qname      ZSet, score = leaseTime
 	keyStatusCompleted = "tq:{%s}:job:completed" // qname      ZSet, score = completedAt
-	keyStatusFailed     = "tq:{%s}:job:failed"    // qname      ZSet, score = failedAt
-	keyStatusScheduled  = "tq:{%s}:job:scheduled"  // qname      ZSet, score = scheduledAt
-	keyStatusRetry      = "tq:{%s}:job:retry"      // qname      ZSet, score = nextRetryAt
+	keyStatusFailed    = "tq:{%s}:job:failed"    // qname      ZSet, score = failedAt
+	keyStatusScheduled = "tq:{%s}:job:scheduled" // qname      ZSet, score = scheduledAt
+	keyStatusRetry     = "tq:{%s}:job:retry"     // qname      ZSet, score = nextRetryAt
 )
 
 func jobKey(j *Job) string             { return fmt.Sprintf(keyJob, j.qname, j.ID) }
