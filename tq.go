@@ -2,6 +2,7 @@ package tq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -139,65 +140,58 @@ func Run(ctx context.Context, rdb *RDB, handlemap H, concurrency int) error {
 	return nil
 }
 
+var errNoHandler = errors.New("no handler for task type")
+
+// runJob runs one job's handler with the job's timeout policy.
+// Panics from the handler are converted to errors. It does no queue
+// bookkeeping, so it can be tested with fake handlers, no backend needed.
+func runJob(ctx context.Context, job *Job, handle Handle) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	if job.Opts.Timeout <= 0 {
+		return handle(ctx, job)
+	}
+	jobCtx, cancel := context.WithTimeout(ctx, job.Opts.Timeout)
+	defer cancel()
+	return handle(jobCtx, job)
+}
+
+// settle records the outcome of one job: completed on success, failed otherwise.
+func settle(ctx context.Context, rdb *RDB, job *Job, runErr error) {
+	if runErr != nil {
+		reason := runErr.Error()
+		if err := retry(3, func() error { return rdb.markAsFailed(ctx, job, reason) }); err != nil {
+			slog.Error("markAsFailed failed after retries",
+				"job_id", job.ID, "type", job.Type, "reason", reason, "error", err)
+		}
+		return
+	}
+	if err := retry(3, func() error { return rdb.markAsCompleted(ctx, job) }); err != nil {
+		slog.Error("markAsCompleted failed after retries",
+			"job_id", job.ID, "type", job.Type, "error", err)
+	}
+}
+
 func workerLoop(ctx context.Context, wg *sync.WaitGroup, rdb *RDB, handlemap H) {
 	defer wg.Done()
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		default:
 		}
 		job, err := rdb.dequeue(ctx, defaultQueueName) // TODO: now use only defaultQueueName
 		if err != nil {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-
 		handle, ok := handlemap[job.Type]
 		if !ok {
-			if retryErr := retry(3, func() error {
-				return rdb.markAsFailed(ctx, job, "no handler for task type")
-			}); retryErr != nil {
-				slog.Error("markAsFailed (no handler) failed after retries",
-					"job_id", job.ID, "type", job.Type, "error", retryErr)
-			}
+			settle(ctx, rdb, job, errNoHandler)
 			continue
 		}
-
-		if err := func() (err error) {
-			var (
-				jobCtx context.Context
-				cancel context.CancelFunc
-			)
-			if job.Opts.Timeout > 0 {
-				jobCtx, cancel = context.WithTimeout(ctx, job.Opts.Timeout)
-				defer cancel()
-			} else {
-				jobCtx = ctx
-			}
-
-			defer func() {
-				if r := recover(); r != nil {
-					err = fmt.Errorf("panic: %v", r) // if handle panic, transform it to an error
-				}
-			}()
-
-			return handle(jobCtx, job)
-		}(); err != nil {
-			if retryErr := retry(3, func() error {
-				return rdb.markAsFailed(ctx, job, err.Error())
-			}); retryErr != nil {
-				slog.Error("markAsFailed after handler error failed after retries",
-					"job_id", job.ID, "type", job.Type, "handler_error", err, "error", retryErr)
-			}
-		} else {
-			if retryErr := retry(3, func() error {
-				return rdb.markAsCompleted(ctx, job)
-			}); retryErr != nil {
-				slog.Error("markAsCompleted failed after retries",
-					"job_id", job.ID, "type", job.Type, "error", retryErr)
-			}
-		}
+		settle(ctx, rdb, job, runJob(ctx, job, handle))
 	}
 }
 
