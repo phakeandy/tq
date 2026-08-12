@@ -133,13 +133,13 @@ func Run(ctx context.Context, rdb *RDB, handlemap H, concurrency int) error {
 	var wg sync.WaitGroup
 	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
-		go processJob(ctx, &wg, rdb, handlemap)
+		go workerLoop(ctx, &wg, rdb, handlemap)
 	}
 	wg.Wait()
 	return nil
 }
 
-func processJob(ctx context.Context, wg *sync.WaitGroup, rdb *RDB, handlemap H) {
+func workerLoop(ctx context.Context, wg *sync.WaitGroup, rdb *RDB, handlemap H) {
 	defer wg.Done()
 	for {
 		select {
