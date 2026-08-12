@@ -2,6 +2,7 @@ package tq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -144,5 +145,77 @@ func TestRunDefaultTimeoutReachesWorker(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("handler was never invoked")
+	}
+}
+
+// TestRunHandlerError verifies that a handler returning a plain error sends
+// the job to the failed state with the error message recorded.
+func TestRunHandlerError(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	jobKey := enqueueTask(t, r, client, NewTask("fail:task", []byte(`{}`)))
+
+	fail := func(ctx context.Context, j *Job) error {
+		return errors.New("boom")
+	}
+	startRun(t, r, H{"fail:task": fail}, 1)
+
+	fields := waitTerminal(t, client, jobKey, 3*time.Second)
+	if got := fields[fieldStatus]; got != StatusFailed.String() {
+		t.Fatalf("status = %q, want %q", got, StatusFailed.String())
+	}
+	if got := fields[fieldError]; got != "boom" {
+		t.Errorf("error = %q, want %q", got, "boom")
+	}
+}
+
+// TestRunNoHandler verifies that a job whose type has no registered handler
+// is marked failed with a descriptive reason.
+func TestRunNoHandler(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	jobKey := enqueueTask(t, r, client, NewTask("nobody:home", []byte(`{}`)))
+
+	startRun(t, r, H{"some:other": func(ctx context.Context, j *Job) error { return nil }}, 1)
+
+	fields := waitTerminal(t, client, jobKey, 3*time.Second)
+	if got := fields[fieldStatus]; got != StatusFailed.String() {
+		t.Fatalf("status = %q, want %q", got, StatusFailed.String())
+	}
+	if got := fields[fieldError]; got != "no handler for task type" {
+		t.Errorf("error = %q, want %q", got, "no handler for task type")
+	}
+}
+
+// TestRunHandlerPanic verifies F9: a panicking handler fails the job without
+// killing the worker — a second job submitted afterwards must still run.
+func TestRunHandlerPanic(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	boom := func(ctx context.Context, j *Job) error {
+		panic("kaboom")
+	}
+	ok := func(ctx context.Context, j *Job) error { return nil }
+	startRun(t, r, H{"panic:task": boom, "ok:task": ok}, 1)
+
+	// First job: handler panics, must end up failed with the panic message.
+	panicKey := enqueueTask(t, r, client, NewTask("panic:task", []byte(`{}`)))
+	fields := waitTerminal(t, client, panicKey, 3*time.Second)
+	if got := fields[fieldStatus]; got != StatusFailed.String() {
+		t.Fatalf("status = %q, want %q", got, StatusFailed.String())
+	}
+	if got := fields[fieldError]; !strings.Contains(got, "panic: kaboom") {
+		t.Errorf("error = %q, want it to contain %q", got, "panic: kaboom")
+	}
+
+	// Second job: same worker (concurrency=1) must still be alive and complete it.
+	okKey := enqueueTask(t, r, client, NewTask("ok:task", []byte(`{}`)))
+	fields = waitTerminal(t, client, okKey, 3*time.Second)
+	if got := fields[fieldStatus]; got != StatusCompleted.String() {
+		t.Fatalf("worker died after panic: second job status = %q, want %q",
+			got, StatusCompleted.String())
 	}
 }

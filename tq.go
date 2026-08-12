@@ -3,6 +3,7 @@ package tq
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -132,13 +133,13 @@ func Run(ctx context.Context, rdb *RDB, handlemap H, concurrency int) error {
 	var wg sync.WaitGroup
 	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
-		go processJob(ctx, wg, rdb, handlemap)
+		go processJob(ctx, &wg, rdb, handlemap)
 	}
 	wg.Wait()
 	return nil
 }
 
-func processJob(ctx context.Context, wg sync.WaitGroup, rdb *RDB, handlemap H) {
+func processJob(ctx context.Context, wg *sync.WaitGroup, rdb *RDB, handlemap H) {
 	defer wg.Done()
 	for {
 		select {
@@ -154,41 +155,47 @@ func processJob(ctx context.Context, wg sync.WaitGroup, rdb *RDB, handlemap H) {
 
 		handle, ok := handlemap[job.Type]
 		if !ok {
-			if retryErr := retry(3, func () error {
-				return rdb.markAsFailed(ctx, job, err.Error())
-			}; retryErr !=nil {
-				// no way... only we can do is loging
+			if retryErr := retry(3, func() error {
+				return rdb.markAsFailed(ctx, job, "no handler for task type")
+			}); retryErr != nil {
+				slog.Error("markAsFailed (no handler) failed after retries",
+					"job_id", job.ID, "type", job.Type, "error", retryErr)
 			}
 			continue
 		}
-		jobCtx := ctx
-		var cancel context.CancelFunc
-		if job.Opts.Timeout > 0 {
-			jobCtx, cancel = context.WithTimeout(ctx, job.Opts.Timeout)
-		}
-		var handleErr error
-		func () {
+
+		if err := func() (err error) {
+			var (
+				jobCtx context.Context
+				cancel context.CancelFunc
+			)
+			if job.Opts.Timeout > 0 {
+				jobCtx, cancel = context.WithTimeout(ctx, job.Opts.Timeout)
+				defer cancel()
+			} else {
+				jobCtx = ctx
+			}
+
 			defer func() {
 				if r := recover(); r != nil {
-					handleErr = fmt.Errorf("panic: %v", r) // panic -> error
+					err = fmt.Errorf("panic: %v", r) // if handle panic, transform it to an error
 				}
 			}()
-			handleErr = handle(jobCtx, job)
-		}()
-		if cancel != nil {
-			cancel() // release the timer immediately after the handler return (defer cannot be used in a for loop)
-		}
-		if handleErr != nil {
-			if retryErr := retry(3, func () error {
+
+			return handle(jobCtx, job)
+		}(); err != nil {
+			if retryErr := retry(3, func() error {
 				return rdb.markAsFailed(ctx, job, err.Error())
-			}; retryErr !=nil {
-				// no way... only we can do is loging
+			}); retryErr != nil {
+				slog.Error("markAsFailed after handler error failed after retries",
+					"job_id", job.ID, "type", job.Type, "handler_error", err, "error", retryErr)
 			}
 		} else {
-			if retryErr := retry(3, func () error {
+			if retryErr := retry(3, func() error {
 				return rdb.markAsCompleted(ctx, job)
-			}; retryErr !=nil {
-				// no way... only we can do is loging
+			}); retryErr != nil {
+				slog.Error("markAsCompleted failed after retries",
+					"job_id", job.ID, "type", job.Type, "error", retryErr)
 			}
 		}
 	}
@@ -197,7 +204,7 @@ func processJob(ctx context.Context, wg sync.WaitGroup, rdb *RDB, handlemap H) {
 func retry(attempts int, fn func() error) error {
 	var err error
 	for i := 0; i < attempts; i++ {
-		if err == fn(); err = nil {
+		if err = fn(); err == nil {
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)

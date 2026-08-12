@@ -8,16 +8,14 @@ import (
 	"time"
 
 	"github.com/phakeandy/tq"
-	"github.com/redis/go-redis/v9"
+	"github.com/phakeandy/tq/internal/testutil"
 )
 
 func TestRun(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	defer client.Close()
-
+	client := testutil.SetupRedis(t)
 	r := tq.NewRDB(client)
 
 	sendEmail := func(ctx context.Context, job *tq.Job) error {
