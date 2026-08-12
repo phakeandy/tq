@@ -3,6 +3,7 @@ package tq
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -35,6 +36,8 @@ const (
 	StatusRunning
 	StatusCompleted
 	StatusFailed
+	StatusScheduled
+	StatusRetry
 )
 
 // String returns the string representation of the status.
@@ -48,6 +51,10 @@ func (s Status) String() string {
 		return "completed"
 	case StatusFailed:
 		return "failed"
+	case StatusScheduled:
+		return "scheduled"
+	case StatusRetry:
+		return "retry"
 	default:
 		panic(fmt.Sprintf("ERROR: illegal status number: %d", s))
 	}
@@ -65,6 +72,16 @@ type options struct {
 	IdempotencyKey string        `json:"idempotency_key"`
 	Delay          time.Duration `json:"delay"`
 	Timeout        time.Duration `json:"timeout"`
+}
+
+// defaultOptions returns the option values used when the corresponding
+// With* function is not called. It must be applied BEFORE user options so
+// that an explicit zero value (e.g. WithMaxRetries(0)) overrides a default.
+func defaultOptions() options {
+	return options{
+		MaxRetries: 3,
+		Timeout:    30 * time.Second,
+	}
 }
 
 // WithMaxRetries sets the maximum number of retries on failure.
@@ -116,36 +133,81 @@ func Run(ctx context.Context, rdb *RDB, handlemap H, concurrency int) error {
 	var wg sync.WaitGroup
 	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				job, err := rdb.dequeue(ctx, defaultQueueName)
-				if err != nil {
-					time.Sleep(200 * time.Millisecond)
-					continue
-				}
-
-				handler, ok := handlemap[job.Type]
-				if !ok {
-					// TODO: add retry
-					_ = rdb.markAsFailed(ctx, job, "no handler for task type")
-					continue
-				}
-
-				if err := handler(ctx, job); err != nil {
-					// TODO: add retry
-					_ = rdb.markAsFailed(ctx, job, err.Error())
-				} else {
-					_ = rdb.markAsCompleted(ctx, job)
-				}
-			}
-		}()
+		go processJob(ctx, &wg, rdb, handlemap)
 	}
 	wg.Wait()
 	return nil
+}
+
+func processJob(ctx context.Context, wg *sync.WaitGroup, rdb *RDB, handlemap H) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		job, err := rdb.dequeue(ctx, defaultQueueName) // TODO: now use only defaultQueueName
+		if err != nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		handle, ok := handlemap[job.Type]
+		if !ok {
+			if retryErr := retry(3, func() error {
+				return rdb.markAsFailed(ctx, job, "no handler for task type")
+			}); retryErr != nil {
+				slog.Error("markAsFailed (no handler) failed after retries",
+					"job_id", job.ID, "type", job.Type, "error", retryErr)
+			}
+			continue
+		}
+
+		if err := func() (err error) {
+			var (
+				jobCtx context.Context
+				cancel context.CancelFunc
+			)
+			if job.Opts.Timeout > 0 {
+				jobCtx, cancel = context.WithTimeout(ctx, job.Opts.Timeout)
+				defer cancel()
+			} else {
+				jobCtx = ctx
+			}
+
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("panic: %v", r) // if handle panic, transform it to an error
+				}
+			}()
+
+			return handle(jobCtx, job)
+		}(); err != nil {
+			if retryErr := retry(3, func() error {
+				return rdb.markAsFailed(ctx, job, err.Error())
+			}); retryErr != nil {
+				slog.Error("markAsFailed after handler error failed after retries",
+					"job_id", job.ID, "type", job.Type, "handler_error", err, "error", retryErr)
+			}
+		} else {
+			if retryErr := retry(3, func() error {
+				return rdb.markAsCompleted(ctx, job)
+			}); retryErr != nil {
+				slog.Error("markAsCompleted failed after retries",
+					"job_id", job.ID, "type", job.Type, "error", retryErr)
+			}
+		}
+	}
+}
+
+func retry(attempts int, fn func() error) error {
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return err
 }

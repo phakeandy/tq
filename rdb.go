@@ -52,6 +52,8 @@ const (
 	keyStatusRunning   = "tq:{%s}:job:running"   // qname      ZSet, score = leaseTime
 	keyStatusCompleted = "tq:{%s}:job:completed" // qname      ZSet, score = completedAt
 	keyStatusFailed    = "tq:{%s}:job:failed"    // qname      ZSet, score = failedAt
+	keyStatusScheduled = "tq:{%s}:job:scheduled" // qname      ZSet, score = scheduledAt
+	keyStatusRetry     = "tq:{%s}:job:retry"     // qname      ZSet, score = nextRetryAt
 )
 
 func jobKey(j *Job) string             { return fmt.Sprintf(keyJob, j.qname, j.ID) }
@@ -59,6 +61,8 @@ func pendingKey(qname string) string   { return fmt.Sprintf(keyStatusPending, qn
 func runningKey(qname string) string   { return fmt.Sprintf(keyStatusRunning, qname) }
 func completedKey(qname string) string { return fmt.Sprintf(keyStatusCompleted, qname) }
 func failedKey(qname string) string    { return fmt.Sprintf(keyStatusFailed, qname) }
+func scheduledKey(qname string) string { return fmt.Sprintf(keyStatusScheduled, qname) }
+func retryKey(qname string) string     { return fmt.Sprintf(keyStatusRetry, qname) }
 
 const statsTTL = 90 * 24 * time.Hour // 90 days
 
@@ -101,7 +105,7 @@ redis.call("LPUSH", pending_queue, job_id)
 return 1
 `)
 	jobID := uuid.New()
-	var o options
+	o := defaultOptions()
 	for _, opt := range t.opts {
 		opt(&o)
 	}
