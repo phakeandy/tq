@@ -83,25 +83,39 @@ func NewRDB(client redis.UniversalClient) *RDB {
 // enqueue adds the given task to the pending list of the queue.
 func (r *RDB) enqueue(ctx context.Context, qname string, t *Task) error {
 	script := redis.NewScript(`
-local job_key = KEYS[1]
-local pending_queue = KEYS[2]
+local job_key          = KEYS[1]
+local pending_queue    = KEYS[2]
+local scheduled_queue  = KEYS[3]
 
-local job_id          = ARGV[1]
-local now             = ARGV[2]
-local job_body        = ARGV[3]
-local field_body      = ARGV[4]
-local field_status    = ARGV[5]
-local pending_status  = ARGV[6]
-local field_pending   = ARGV[7]
+local job_id            = ARGV[1]
+local now               = ARGV[2]
+local process_at        = ARGV[3]
+local job_body          = ARGV[4]
+local field_body        = ARGV[5]
+local field_status      = ARGV[6]
+local pending_status    = ARGV[7]
+local scheduled_status  = ARGV[8]
+local field_pending     = ARGV[9]
 
 if redis.call("EXISTS", job_key) == 1 then
-	return 0
+  return 0
 end
-redis.call("HSET", job_key,
-	   field_body, job_body,
-           field_status, pending_status,
-           field_pending, now)
-redis.call("LPUSH", pending_queue, job_id)
+
+if tonumber(process_at) > tonumber(now) then
+  -- set delay
+  redis.call("HSET", job_key,
+             field_body, job_body,
+             field_status, scheduled_status)
+  redis.call("ZADD", scheduled_queue, process_at, job_id)
+elseif tonumber(process_at) == tonumber(now) then
+  redis.call("HSET", job_key,
+             field_body, job_body,
+             field_status, pending_status,
+             field_pending, now)
+  redis.call("LPUSH", pending_queue, job_id)
+else -- tonumber(process_at) < tonumber(now)
+  return error_reply("nagetive delay")
+end
 return 1
 `)
 	jobID := uuid.New()
@@ -119,17 +133,23 @@ return 1
 		return err
 	}
 
+	now := time.Now()
+	processAt := now.Add(o.Delay)
+
 	keys := []string{
 		fmt.Sprintf(keyJob, qname, jobID),
 		pendingKey(qname),
+	        scheduledKey(qname),
 	}
 	argv := []interface{}{
 		jobID.String(),
-		time.Now().Unix(),
+		now.Unix(),
+		processAt.Unix(),
 		string(body),
 		fieldBody,
 		fieldStatus,
 		StatusPending.String(),
+		StatusScheduled.String(),
 		fieldPendingSince,
 	}
 	cmd := script.Run(ctx, r.client, keys, argv...)
@@ -262,6 +282,14 @@ return "OK"
 	}
 	return nil
 }
+
+// forward moves tasks with a score less than the current unix time from the
+// delayed (i.e. scheduled | retry) zset to the pending list.
+func (r *RDB) forward(ctx context.Context) {
+	cmd := redis.NewScript(`
+`)
+}
+
 
 // decodeJob translates from hash field in redis (tq:{<qname>}:job:<id>) to Job
 // struct.

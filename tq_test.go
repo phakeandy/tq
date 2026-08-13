@@ -1,14 +1,16 @@
-package tq_test
+package tq
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/phakeandy/tq"
 	"github.com/phakeandy/tq/internal/testutil"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestRun(t *testing.T) {
@@ -16,9 +18,9 @@ func TestRun(t *testing.T) {
 	defer cancel()
 
 	client := testutil.SetupRedis(t)
-	r := tq.NewRDB(client)
+	r := NewRDB(client)
 
-	sendEmail := func(ctx context.Context, job *tq.Job) error {
+	sendEmail := func(ctx context.Context, job *Job) error {
 		var p struct {
 			From string `json:"from"`
 			To   string `json:"to"`
@@ -30,11 +32,11 @@ func TestRun(t *testing.T) {
 		return nil
 	}
 
-	h := tq.H{
+	h := H{
 		"email:send": sendEmail,
 	}
 
-	err := tq.Run(ctx, r, h, 3)
+	err := Run(ctx, r, h, 3)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}

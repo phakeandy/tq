@@ -105,6 +105,69 @@ func TestEnqueue(t *testing.T) {
 	}
 }
 
+func TestEnqueueScheduled(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	const delay = 30 * time.Second
+	task := NewTask("email:send", samplePayload, WithDelay(delay))
+
+	testutil.FlushDB(t, client)
+
+	before := time.Now().Unix()
+	if err := r.enqueue(context.Background(), defaultQueueName, task); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	after := time.Now().Unix()
+
+	// A delayed job must NOT land in the pending list.
+	pending := testutil.GetList(t, client, pendingKey(defaultQueueName))
+	if len(pending) != 0 {
+		t.Fatalf("pending list has %d entries, want 0", len(pending))
+	}
+
+	// It must land in the scheduled zset, with score == process_at.
+	scheduled := testutil.GetZSet(t, client, scheduledKey(defaultQueueName))
+	if len(scheduled) != 1 {
+		t.Fatalf("scheduled zset has %d entries, want 1", len(scheduled))
+	}
+	score := int64(scheduled[0].Score)
+	secs := int64(delay / time.Second)
+	if min, max := before+secs, after+secs; score < min || score > max {
+		t.Errorf("scheduled score = %d, want in [%d, %d]", score, min, max)
+	}
+
+	member, ok := scheduled[0].Member.(string)
+	if !ok {
+		t.Fatalf("scheduled member is not a string: %v", scheduled[0].Member)
+	}
+	jobID, err := uuid.Parse(member)
+	if err != nil {
+		t.Fatalf("invalid job ID in scheduled zset: %q", member)
+	}
+	job := &Job{JobBody: JobBody{ID: jobID}, qname: defaultQueueName}
+	fields := testutil.GetHash(t, client, jobKey(job))
+
+	if got := fields[fieldStatus]; got != StatusScheduled.String() {
+		t.Errorf("status = %q, want %q", got, StatusScheduled.String())
+	}
+
+	var gotBody JobBody
+	if err := json.Unmarshal([]byte(fields[fieldBody]), &gotBody); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if gotBody.Type != task.typ {
+		t.Errorf("Type = %q, want %q", gotBody.Type, task.typ)
+	}
+	if string(gotBody.Payload) != string(task.payload) {
+		t.Errorf("Payload = %s, want %s", gotBody.Payload, task.payload)
+	}
+	// The delay survives the round-trip through the serialized options.
+	if gotBody.Opts.Delay != delay {
+		t.Errorf("Delay = %v, want %v", gotBody.Opts.Delay, delay)
+	}
+}
+
 // ──────────────────────────── dequeue ────────────────────────────
 
 func TestDequeue(t *testing.T) {
