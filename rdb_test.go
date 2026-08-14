@@ -52,6 +52,25 @@ func seedRunningJob(tb testing.TB, client redis.UniversalClient, job *Job) {
 	})
 }
 
+// seedDelayedJob writes a job into one of the delayed zsets (scheduled/retry)
+// with the given status and due time, mimicking what enqueue/retry do.
+func seedDelayedJob(tb testing.TB, client redis.UniversalClient, job *Job, zsetKey string, status Status, due time.Time) {
+	tb.Helper()
+	ctx := context.Background()
+	body, err := json.Marshal(job.JobBody)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	client.HSet(ctx, jobKey(job),
+		fieldBody, string(body),
+		fieldStatus, status.String(),
+	)
+	client.ZAdd(ctx, zsetKey, redis.Z{
+		Member: job.ID.String(),
+		Score:  float64(due.Unix()),
+	})
+}
+
 // ──────────────────────────── enqueue ────────────────────────────
 
 func TestEnqueue(t *testing.T) {
@@ -219,6 +238,184 @@ func TestDequeue(t *testing.T) {
 		_, err := r.dequeue(context.Background(), defaultQueueName)
 		if err == nil {
 			t.Fatal("expected error on empty queue, got nil")
+		}
+	})
+}
+
+// ──────────────────────────── forward ────────────────────────────
+
+func TestForward(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	newJob := func() *Job {
+		return &Job{
+			JobBody: JobBody{ID: uuid.New(), Type: "email:send", Payload: samplePayload},
+			qname:   defaultQueueName,
+		}
+	}
+
+	t.Run("moves a due scheduled job to pending", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := newJob()
+		seedDelayedJob(t, client, job, scheduledKey(defaultQueueName),
+			StatusScheduled, time.Now().Add(-time.Second))
+
+		moved, err := r.forward(context.Background(), defaultQueueName)
+		if err != nil {
+			t.Fatalf("forward: %v", err)
+		}
+		if moved != 1 {
+			t.Errorf("forward moved %d jobs, want 1", moved)
+		}
+
+		if got := testutil.GetZSet(t, client, scheduledKey(defaultQueueName)); len(got) != 0 {
+			t.Errorf("scheduled zset has %d entries, want 0", len(got))
+		}
+
+		pending := testutil.GetList(t, client, pendingKey(defaultQueueName))
+		if len(pending) != 1 || pending[0] != job.ID.String() {
+			t.Errorf("pending list = %v, want [%s]", pending, job.ID)
+		}
+
+		fields := testutil.GetHash(t, client, jobKey(job))
+		if got := fields[fieldStatus]; got != StatusPending.String() {
+			t.Errorf("status = %q, want %q", got, StatusPending.String())
+		}
+		if _, ok := fields[fieldPendingSince]; !ok {
+			t.Errorf("pending_since not set after forward")
+		}
+	})
+
+	t.Run("leaves a future scheduled job untouched", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := newJob()
+		seedDelayedJob(t, client, job, scheduledKey(defaultQueueName),
+			StatusScheduled, time.Now().Add(30*time.Second))
+
+		moved, err := r.forward(context.Background(), defaultQueueName)
+		if err != nil {
+			t.Fatalf("forward: %v", err)
+		}
+		if moved != 0 {
+			t.Errorf("forward moved %d jobs, want 0", moved)
+		}
+
+		if got := testutil.GetZSet(t, client, scheduledKey(defaultQueueName)); len(got) != 1 {
+			t.Errorf("scheduled zset has %d entries, want 1", len(got))
+		}
+
+		if got := testutil.GetList(t, client, pendingKey(defaultQueueName)); len(got) != 0 {
+			t.Errorf("pending list has %d entries, want 0", len(got))
+		}
+
+		fields := testutil.GetHash(t, client, jobKey(job))
+		if got := fields[fieldStatus]; got != StatusScheduled.String() {
+			t.Errorf("status = %q, want %q", got, StatusScheduled.String())
+		}
+	})
+
+	t.Run("moves a due retry job to pending", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := newJob()
+		seedDelayedJob(t, client, job, retryKey(defaultQueueName),
+			StatusRetry, time.Now().Add(-time.Second))
+
+		moved, err := r.forward(context.Background(), defaultQueueName)
+		if err != nil {
+			t.Fatalf("forward: %v", err)
+		}
+		if moved != 1 {
+			t.Errorf("forward moved %d jobs, want 1", moved)
+		}
+
+		if got := testutil.GetZSet(t, client, retryKey(defaultQueueName)); len(got) != 0 {
+			t.Errorf("retry zset has %d entries, want 0", len(got))
+		}
+
+		pending := testutil.GetList(t, client, pendingKey(defaultQueueName))
+		if len(pending) != 1 || pending[0] != job.ID.String() {
+			t.Errorf("pending list = %v, want [%s]", pending, job.ID)
+		}
+
+		fields := testutil.GetHash(t, client, jobKey(job))
+		if got := fields[fieldStatus]; got != StatusPending.String() {
+			t.Errorf("status = %q, want %q", got, StatusPending.String())
+		}
+	})
+
+	t.Run("moves scheduled and retry in one call", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		sched := newJob()
+		retryJob := newJob()
+		seedDelayedJob(t, client, sched, scheduledKey(defaultQueueName),
+			StatusScheduled, time.Now().Add(-time.Second))
+		seedDelayedJob(t, client, retryJob, retryKey(defaultQueueName),
+			StatusRetry, time.Now().Add(-time.Second))
+
+		moved, err := r.forward(context.Background(), defaultQueueName)
+		if err != nil {
+			t.Fatalf("forward: %v", err)
+		}
+		if moved != 2 {
+			t.Errorf("forward moved %d jobs, want 2", moved)
+		}
+
+		pending := testutil.GetList(t, client, pendingKey(defaultQueueName))
+		if len(pending) != 2 {
+			t.Fatalf("pending list has %d entries, want 2", len(pending))
+		}
+		seen := map[string]bool{pending[0]: true, pending[1]: true}
+		if !seen[sched.ID.String()] || !seen[retryJob.ID.String()] {
+			t.Errorf("pending list = %v, want both job IDs", pending)
+		}
+	})
+
+	t.Run("forwarding twice does not duplicate", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := newJob()
+		seedDelayedJob(t, client, job, scheduledKey(defaultQueueName),
+			StatusScheduled, time.Now().Add(-time.Second))
+
+		moved, err := r.forward(context.Background(), defaultQueueName)
+		if err != nil {
+			t.Fatalf("first forward: %v", err)
+		}
+		if moved != 1 {
+			t.Fatalf("first forward moved %d jobs, want 1", moved)
+		}
+
+		moved, err = r.forward(context.Background(), defaultQueueName)
+		if err != nil {
+			t.Fatalf("second forward: %v", err)
+		}
+		if moved != 0 {
+			t.Fatalf("second forward moved %d jobs, want 0", moved)
+		}
+
+		if got := testutil.GetList(t, client, pendingKey(defaultQueueName)); len(got) != 1 {
+			t.Errorf("pending list has %d entries, want 1", len(got))
+		}
+	})
+
+	t.Run("job due exactly now is forwarded", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := newJob()
+		seedDelayedJob(t, client, job, scheduledKey(defaultQueueName),
+			StatusScheduled, time.Now())
+
+		moved, err := r.forward(context.Background(), defaultQueueName)
+		if err != nil {
+			t.Fatalf("forward: %v", err)
+		}
+		if moved != 1 {
+			t.Errorf("forward moved %d jobs, want 1 (score == now must be included)", moved)
 		}
 	})
 }

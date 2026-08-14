@@ -283,16 +283,66 @@ return "OK"
 	return nil
 }
 
-// forward moves tasks with a score less than the current unix time from the
-// delayed (i.e. scheduled | retry) zset to the pending list.
-func (r *RDB) forward(ctx context.Context) {
-	cmd := redis.NewScript(`
+// forwardBatchSize caps how many delayed jobs a single forward call moves,
+// so one Lua script can't monopolize Redis when a large backlog becomes due.
+const forwardBatchSize = 100
+
+// forward moves tasks whose scheduled/retry time (the zset score) has arrived
+// from the delayed zsets into the pending list, where workers can dequeue them.
+// It returns how many jobs were moved.
+func (r *RDB) forward(ctx context.Context, qname string) (int64, error) {
+	script := redis.NewScript(`
+local scheduled_queue = KEYS[1]
+local retry_queue     = KEYS[2]
+local pending_queue   = KEYS[3]
+
+local job_key_prefix  = ARGV[1]
+local now             = ARGV[2]
+local batch_size      = tonumber(ARGV[3])
+local field_status    = ARGV[4]
+local pending_status  = ARGV[5]
+local field_pending   = ARGV[6]
+
+local moved = 0
+for _, delayed_queue in ipairs({scheduled_queue, retry_queue}) do
+  local remaining = batch_size - moved
+  if remaining <= 0 then break end
+
+  local job_ids = redis.call("ZRANGEBYSCORE", delayed_queue, "-inf", now, "LIMIT", 0, remaining)
+  for _, job_id in ipairs(job_ids) do
+    -- ZREM returns 1 only to the caller that actually removes the member,
+    -- so concurrent forwarders can never move the same job twice.
+    if redis.call("ZREM", delayed_queue, job_id) == 1 then
+      local job_key = job_key_prefix .. job_id
+      redis.call("LPUSH", pending_queue, job_id)
+      redis.call("HSET", job_key,
+                  field_status, pending_status,
+                  field_pending, now)
+      moved = moved + 1
+    end
+  end
+end
+
+return moved
 `)
+	keys := []string{
+		scheduledKey(qname),
+		retryKey(qname),
+		pendingKey(qname),
+	}
+	argv := []interface{}{
+		fmt.Sprintf(keyJob, qname, ""), // job key prefix; id appended in-script
+		time.Now().Unix(),
+		forwardBatchSize,
+		fieldStatus,
+		StatusPending.String(),
+		fieldPendingSince,
+	}
+	return script.Run(ctx, r.client, keys, argv...).Int64()
 }
 
 
-// decodeJob translates from hash field in redis (tq:{<qname>}:job:<id>) to Job
-// struct.
+// decodeJob translates from hash field in redis (tq:{<qname>}:job:<id>) to Job struct.
 func decodeJob(qname string, fields map[string]string) (*Job, error) {
 	body, ok := fields[fieldBody]
 	if !ok {
