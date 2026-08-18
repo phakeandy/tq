@@ -87,7 +87,6 @@ func defaultOptions() options {
 
 // WithMaxRetries sets the maximum number of retries on failure.
 // Not calling it uses the default (3). 0 means no retries at all.
-// TODO(F4): retry logic not yet implemented; field is reserved.
 func WithMaxRetries(n int) Option {
 	return func(o *options) { o.MaxRetries = n }
 }
@@ -100,7 +99,6 @@ func WithIdempotencyKey(k string) Option {
 }
 
 // WithDelay postpones execution by this duration. Zero means immediate execution.
-// TODO(F3): delayed execution not yet implemented; field is reserved.
 func WithDelay(d time.Duration) Option {
 	return func(o *options) { o.Delay = d }
 }
@@ -132,10 +130,12 @@ func Run(ctx context.Context, rdb *RDB, handlemap H, concurrency int) error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(concurrency)
+	wg.Add(concurrency + 2)
 	for i := 0; i < concurrency; i++ {
 		go workerLoop(ctx, &wg, rdb, handlemap)
 	}
+	go forwardLoop(ctx, &wg, rdb)
+	go recoveryLoop(ctx, &wg, rdb)
 	wg.Wait()
 	return nil
 }
@@ -159,10 +159,23 @@ func runJob(ctx context.Context, job *Job, handle Handle) (err error) {
 	return handle(jobCtx, job)
 }
 
-// settle records the outcome of one job: completed on success, failed otherwise.
+// settle is the policy decision point after one execution attempt: it decides
+// the job's next state and persists it. On success the job is completed; on
+// failure it is either scheduled for a retry with exponential backoff (while
+// attempts remain) or marked as finally failed.
 func settle(ctx context.Context, rdb *RDB, job *Job, runErr error) {
 	if runErr != nil {
 		reason := runErr.Error()
+		// Retry while attempts remain, with exponential backoff
+		if job.Opts.MaxRetries > 0 && job.retried < job.Opts.MaxRetries {
+			next := time.Now().Add(backoff(job.retried))
+			if err := retry(3, func() error { return rdb.markAsRetry(ctx, job, next) }); err != nil {
+				slog.Error("markAsRetry failed after retries",
+					"job_id", job.ID, "type", job.Type, "error", err)
+			}
+			return
+		}
+		// Retries exhausted: final failure.
 		if err := retry(3, func() error { return rdb.markAsFailed(ctx, job, reason) }); err != nil {
 			slog.Error("markAsFailed failed after retries",
 				"job_id", job.ID, "type", job.Type, "reason", reason, "error", err)
@@ -175,16 +188,34 @@ func settle(ctx context.Context, rdb *RDB, job *Job, runErr error) {
 	}
 }
 
+const maxBackoff = 30 * time.Second
+
+// backoff returns the wait before retry number retried (0-based), doubling
+// each time: 1s, 2s, 4s, ...
+func backoff(retried int) time.Duration {
+	d := time.Duration(1<<retried) * time.Second
+	if d > maxBackoff {
+		return maxBackoff
+	}
+	return d
+}
+
 func workerLoop(ctx context.Context, wg *sync.WaitGroup, rdb *RDB, handlemap H) {
 	defer wg.Done()
 	for {
-		if ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
 			return
+		default:
 		}
 		job, err := rdb.dequeue(ctx, defaultQueueName) // TODO: now use only defaultQueueName
 		if err != nil {
-			time.Sleep(200 * time.Millisecond)
-			continue
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(200 * time.Millisecond):
+				continue
+			}
 		}
 		handle, ok := handlemap[job.Type]
 		if !ok {
@@ -192,6 +223,63 @@ func workerLoop(ctx context.Context, wg *sync.WaitGroup, rdb *RDB, handlemap H) 
 			continue
 		}
 		settle(ctx, rdb, job, runJob(ctx, job, handle))
+	}
+}
+
+// forwardLoop launches a loop that forwards every second.
+func forwardLoop(ctx context.Context, wg *sync.WaitGroup, rdb *RDB) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(1 * time.Second):
+		}
+		for {
+			var n int64
+			err := retry(3, func() error {
+				var ferr error
+				n, ferr = rdb.forward(ctx, defaultQueueName)
+				return ferr
+			})
+			if err != nil {
+				slog.Error("forward failed after retries", "error", err)
+				break
+			}
+			if n == forwardBatchSize {
+				continue
+			}
+			break
+		}
+	}
+}
+
+// recoveryLoop periodically reclaims jobs whose running lease has expired.
+// It runs every second, so recovery latency is roughly leaseDuration + 1s.
+func recoveryLoop(ctx context.Context, wg *sync.WaitGroup, rdb *RDB) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(1 * time.Second):
+		}
+		for {
+			var n int64
+			err := retry(3, func() error {
+				var ferr error
+				n, ferr = rdb.recover(ctx, defaultQueueName)
+				return ferr
+			})
+			if err != nil {
+				slog.Error("recover failed after retries", "error", err)
+				break
+			}
+			if n == recoverBatchSize {
+				continue
+			}
+			break
+		}
 	}
 }
 

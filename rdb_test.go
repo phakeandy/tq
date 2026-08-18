@@ -48,7 +48,7 @@ func seedRunningJob(tb testing.TB, client redis.UniversalClient, job *Job) {
 	)
 	client.ZAdd(ctx, runningKey(job.qname), redis.Z{
 		Member: job.ID.String(),
-		Score:  float64(time.Now().Add(leaseDuration).Unix()),
+		Score:  float64(time.Now().Add(defaultLeaseDuration).Unix()),
 	})
 }
 
@@ -522,6 +522,98 @@ func TestMarkAsFailed(t *testing.T) {
 			qname:   defaultQueueName,
 		}
 		err := r.markAsFailed(context.Background(), job, "reason")
+		if err == nil {
+			t.Fatal("expected error when job is not in running, got nil")
+		}
+	})
+}
+
+// ──────────────────────────── markAsRetry ────────────────────────────
+
+func TestMarkAsRetry(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	newJob := func() *Job {
+		return &Job{
+			JobBody: JobBody{ID: uuid.New(), Type: "email:send", Payload: samplePayload},
+			qname:   defaultQueueName,
+		}
+	}
+
+	t.Run("moves from running to retry and bumps the counter", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := newJob()
+		seedRunningJob(t, client, job)
+
+		next := time.Now().Add(2 * time.Second)
+		if err := r.markAsRetry(context.Background(), job, next); err != nil {
+			t.Fatalf("markAsRetry: %v", err)
+		}
+
+		running := testutil.GetZSet(t, client, runningKey(defaultQueueName))
+		if len(running) != 0 {
+			t.Errorf("running zset has %d entries, want 0", len(running))
+		}
+
+		retrySet := testutil.GetZSet(t, client, retryKey(defaultQueueName))
+		if len(retrySet) != 1 {
+			t.Fatalf("retry zset has %d entries, want 1", len(retrySet))
+		}
+		if retrySet[0].Member != job.ID.String() {
+			t.Errorf("retry member = %v, want %v", retrySet[0].Member, job.ID)
+		}
+		if got := int64(retrySet[0].Score); got != next.Unix() {
+			t.Errorf("retry score = %d, want %d (nextRetryAt)", got, next.Unix())
+		}
+
+		fields := testutil.GetHash(t, client, jobKey(job))
+		if got := fields[fieldStatus]; got != StatusRetry.String() {
+			t.Errorf("status = %q, want %q", got, StatusRetry.String())
+		}
+		if got := fields[fieldRetried]; got != "1" {
+			t.Errorf("retried = %q, want %q", got, "1")
+		}
+	})
+
+	t.Run("counter survives a full retry cycle", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := newJob()
+		seedRunningJob(t, client, job)
+		ctx := context.Background()
+
+		if err := r.markAsRetry(ctx, job, time.Now().Add(-time.Second)); err != nil {
+			t.Fatalf("first markAsRetry: %v", err)
+		}
+		// The retry time has passed: forward moves the job back to pending,
+		// dequeue to running — as the real loop does. The counter rides along.
+		if moved, err := r.forward(ctx, defaultQueueName); err != nil || moved != 1 {
+			t.Fatalf("forward: moved=%d err=%v", moved, err)
+		}
+		job2, err := r.dequeue(ctx, defaultQueueName)
+		if err != nil {
+			t.Fatalf("dequeue: %v", err)
+		}
+		if job2.retried != 1 {
+			t.Errorf("dequeued retried = %d, want 1", job2.retried)
+		}
+
+		if err := r.markAsRetry(ctx, job2, time.Now().Add(-time.Second)); err != nil {
+			t.Fatalf("second markAsRetry: %v", err)
+		}
+		fields := testutil.GetHash(t, client, jobKey(job))
+		if got := fields[fieldRetried]; got != "2" {
+			t.Errorf("retried = %q, want %q", got, "2")
+		}
+	})
+
+	t.Run("job not in running returns error", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		job := newJob()
+		err := r.markAsRetry(context.Background(), job, time.Now())
 		if err == nil {
 			t.Fatal("expected error when job is not in running, got nil")
 		}

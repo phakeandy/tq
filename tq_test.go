@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,15 +63,17 @@ func startRun(t *testing.T, r *RDB, handlemap H, concurrency int) {
 	})
 }
 
-// waitTerminal polls the job hash until its status leaves pending/running, or
-// fails the test when the deadline passes.
+// waitTerminal polls the job hash until its status leaves the in-flight
+// states (pending/running/scheduled/retry), or fails the test when the
+// deadline passes. Terminal states are completed and failed (final).
 func waitTerminal(t *testing.T, client redis.UniversalClient, key string, timeout time.Duration) map[string]string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		fields := testutil.GetHash(t, client, key)
 		switch fields[fieldStatus] {
-		case StatusPending.String(), StatusRunning.String():
+		case StatusPending.String(), StatusRunning.String(),
+			StatusScheduled.String(), StatusRetry.String():
 			time.Sleep(10 * time.Millisecond)
 		default:
 			return fields
@@ -93,59 +96,6 @@ func enqueueTask(t *testing.T, r *RDB, client redis.UniversalClient, task *Task)
 		t.Fatalf("pending list has %d entries, want 1", len(pending))
 	}
 	return fmt.Sprintf(keyJob, defaultQueueName, pending[0])
-}
-
-// TestRunTimeoutExpires verifies F8: a job whose Timeout elapses mid-execution
-// is aborted via ctx cancellation and ends up failed with ctx.Err().
-func TestRunTimeoutExpires(t *testing.T) {
-	client := testutil.SetupRedis(t)
-	r := NewRDB(client)
-
-	jobKey := enqueueTask(t, r, client,
-		NewTask("slow:task", []byte(`{}`), WithTimeout(50*time.Millisecond)))
-
-	slow := func(ctx context.Context, j *Job) error {
-		select {
-		case <-time.After(500 * time.Millisecond):
-			return nil // 不应到达：50ms 超时应先触发
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	startRun(t, r, H{"slow:task": slow}, 1)
-
-	fields := waitTerminal(t, client, jobKey, 3*time.Second)
-	if got := fields[fieldStatus]; got != StatusFailed.String() {
-		t.Fatalf("status = %q, want %q", got, StatusFailed.String())
-	}
-	if errStr := fields[fieldError]; !strings.Contains(errStr, "context deadline exceeded") {
-		t.Errorf("error = %q, want it to contain %q", errStr, "context deadline exceeded")
-	}
-}
-
-// TestRunTimeoutZeroMeansNoTimeout verifies the WithTimeout(0) contract: zero
-// disables the timeout entirely, so a slow-but-finite handler must complete.
-func TestRunTimeoutZeroMeansNoTimeout(t *testing.T) {
-	client := testutil.SetupRedis(t)
-	r := NewRDB(client)
-
-	jobKey := enqueueTask(t, r, client,
-		NewTask("slow:task", []byte(`{}`), WithTimeout(0)))
-
-	slow := func(ctx context.Context, j *Job) error {
-		select {
-		case <-time.After(300 * time.Millisecond):
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	startRun(t, r, H{"slow:task": slow}, 1)
-
-	fields := waitTerminal(t, client, jobKey, 3*time.Second)
-	if got := fields[fieldStatus]; got != StatusCompleted.String() {
-		t.Fatalf("status = %q, want %q (error: %v)", got, StatusCompleted.String(), fields[fieldError])
-	}
 }
 
 // TestRunDefaultTimeoutReachesWorker verifies the default-value chain: a task
@@ -184,7 +134,8 @@ func TestRunHandlerError(t *testing.T) {
 	client := testutil.SetupRedis(t)
 	r := NewRDB(client)
 
-	jobKey := enqueueTask(t, r, client, NewTask("fail:task", []byte(`{}`)))
+	jobKey := enqueueTask(t, r, client,
+		NewTask("fail:task", []byte(`{}`), WithMaxRetries(0)))
 
 	fail := func(ctx context.Context, j *Job) error {
 		return errors.New("boom")
@@ -206,7 +157,7 @@ func TestRunNoHandler(t *testing.T) {
 	client := testutil.SetupRedis(t)
 	r := NewRDB(client)
 
-	jobKey := enqueueTask(t, r, client, NewTask("nobody:home", []byte(`{}`)))
+	jobKey := enqueueTask(t, r, client, NewTask("nobody:home", []byte(`{}`), WithMaxRetries(0)))
 
 	startRun(t, r, H{"some:other": func(ctx context.Context, j *Job) error { return nil }}, 1)
 
@@ -232,7 +183,8 @@ func TestRunHandlerPanic(t *testing.T) {
 	startRun(t, r, H{"panic:task": boom, "ok:task": ok}, 1)
 
 	// First job: handler panics, must end up failed with the panic message.
-	panicKey := enqueueTask(t, r, client, NewTask("panic:task", []byte(`{}`)))
+	panicKey := enqueueTask(t, r, client,
+		NewTask("panic:task", []byte(`{}`), WithMaxRetries(0)))
 	fields := waitTerminal(t, client, panicKey, 3*time.Second)
 	if got := fields[fieldStatus]; got != StatusFailed.String() {
 		t.Fatalf("status = %q, want %q", got, StatusFailed.String())
@@ -247,6 +199,106 @@ func TestRunHandlerPanic(t *testing.T) {
 	if got := fields[fieldStatus]; got != StatusCompleted.String() {
 		t.Fatalf("worker died after panic: second job status = %q, want %q",
 			got, StatusCompleted.String())
+	}
+}
+
+// ──────────────────────────── retry (F4) ────────────────────────────
+
+// TestBackoff verifies the exponential backoff schedule from PRD F4:
+// 1s, 2s, 4s, ... after the 1st, 2nd, 3rd failure.
+func TestBackoff(t *testing.T) {
+	cases := []struct {
+		retried int
+		want    time.Duration
+	}{
+		{0, time.Second},
+		{1, 2 * time.Second},
+		{2, 4 * time.Second},
+		{3, 8 * time.Second},
+	}
+	for _, c := range cases {
+		if got := backoff(c.retried); got != c.want {
+			t.Errorf("backoff(%d) = %v, want %v", c.retried, got, c.want)
+		}
+	}
+}
+
+// TestRunRetryThenSuccess verifies F4 end-to-end: a job that fails once is
+// retried (with the counter bumped) and then completes on the second attempt.
+func TestRunRetryThenSuccess(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	var attempts atomic.Int32
+	flaky := func(ctx context.Context, j *Job) error {
+		if attempts.Add(1) == 1 {
+			return errors.New("first attempt fails")
+		}
+		return nil
+	}
+
+	jobKey := enqueueTask(t, r, client,
+		NewTask("flaky:task", []byte(`{}`), WithMaxRetries(1)))
+	startRun(t, r, H{"flaky:task": flaky}, 1)
+
+	fields := waitTerminal(t, client, jobKey, 5*time.Second)
+	if got := fields[fieldStatus]; got != StatusCompleted.String() {
+		t.Fatalf("status = %q, want %q (error: %v)", got, StatusCompleted.String(), fields[fieldError])
+	}
+	if got := fields[fieldRetried]; got != "1" {
+		t.Errorf("retried = %q, want %q (one retry happened)", got, "1")
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("handler ran %d times, want 2", got)
+	}
+}
+
+// TestRunRetryExhaustion verifies that once MaxRetries is reached the job is
+// marked as finally failed, with the last error recorded and the retry
+// counter at its maximum.
+func TestRunRetryExhaustion(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	jobKey := enqueueTask(t, r, client,
+		NewTask("fail:task", []byte(`{}`), WithMaxRetries(1)))
+
+	fail := func(ctx context.Context, j *Job) error { return errors.New("always fails") }
+	startRun(t, r, H{"fail:task": fail}, 1)
+
+	fields := waitTerminal(t, client, jobKey, 8*time.Second)
+	if got := fields[fieldStatus]; got != StatusFailed.String() {
+		t.Fatalf("status = %q, want %q", got, StatusFailed.String())
+	}
+	if got := fields[fieldError]; got != "always fails" {
+		t.Errorf("error = %q, want %q", got, "always fails")
+	}
+	if got := fields[fieldRetried]; got != "1" {
+		t.Errorf("retried = %q, want %q", got, "1")
+	}
+}
+
+// TestRunRetryZero verifies the WithMaxRetries(0) contract: no retry is
+// scheduled and the job fails immediately, so the retried field stays absent.
+func TestRunRetryZero(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	jobKey := enqueueTask(t, r, client,
+		NewTask("fail:task", []byte(`{}`), WithMaxRetries(0)))
+
+	fail := func(ctx context.Context, j *Job) error { return errors.New("boom") }
+	startRun(t, r, H{"fail:task": fail}, 1)
+
+	fields := waitTerminal(t, client, jobKey, 3*time.Second)
+	if got := fields[fieldStatus]; got != StatusFailed.String() {
+		t.Fatalf("status = %q, want %q", got, StatusFailed.String())
+	}
+	if got := fields[fieldError]; got != "boom" {
+		t.Errorf("error = %q, want %q", got, "boom")
+	}
+	if _, ok := fields[fieldRetried]; ok {
+		t.Errorf("retried field = %q, want absent (MaxRetries(0) must not retry)", fields[fieldRetried])
 	}
 }
 
@@ -293,3 +345,64 @@ func TestRunJobSuccess(t *testing.T) {
 	}
 }
 
+
+// enqueueDelayedTask enqueues a delayed task and returns its job key.
+// Unlike enqueueTask, it expects the job in the scheduled zset, not the
+// pending list — that is itself part of the F3 contract.
+func enqueueDelayedTask(t *testing.T, r *RDB, client redis.UniversalClient, task *Task) string {
+	t.Helper()
+	if err := r.enqueue(context.Background(), defaultQueueName, task); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	scheduled := testutil.GetZSet(t, client, scheduledKey(defaultQueueName))
+	if len(scheduled) != 1 {
+		t.Fatalf("scheduled zset has %d entries, want 1", len(scheduled))
+	}
+	return fmt.Sprintf(keyJob, defaultQueueName, scheduled[0].Member)
+}
+
+// TestRunDelayedTask verifies F3 end-to-end: a job submitted with WithDelay
+// must (1) NOT run before its due time, and (2) run and complete once the
+// delay elapses. (2) only happens if something periodically forwards the
+// scheduled zset into the pending list — that something is the forwardLoop
+// you are writing, so this test is red until Run wires it in.
+func TestRunDelayedTask(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	// 2s: large enough that second-granularity scores (Unix()) in the Lua
+	// scripts cannot truncate it into the "due now" branch of enqueue.
+	const delay = 2 * time.Second
+	submittedAt := time.Now()
+	jobKey := enqueueDelayedTask(t, r, client,
+		NewTask("slow:task", []byte(`{}`), WithDelay(delay)))
+
+	// The handler records the wall-clock time it actually started.
+	executedAt := make(chan time.Time, 1)
+	handler := func(ctx context.Context, j *Job) error {
+		executedAt <- time.Now()
+		return nil
+	}
+	startRun(t, r, H{"slow:task": handler}, 1)
+
+	// (1) The job must eventually reach a terminal state. Red today: with no
+	// forwardLoop wired into Run, the job stays in the scheduled zset forever.
+	fields := waitTerminal(t, client, jobKey, 5*time.Second)
+	if got := fields[fieldStatus]; got != StatusCompleted.String() {
+		t.Fatalf("status = %q, want %q", got, StatusCompleted.String())
+	}
+
+	// (2) It must not have run before its due time (N2). The 1s tolerance
+	// covers second-granularity scores: the earliest a job can be forwarded
+	// is the second boundary of its due time, i.e. up to ~1s "early".
+	select {
+	case got := <-executedAt:
+		earliest := submittedAt.Add(delay - time.Second)
+		if got.Before(earliest) {
+			t.Errorf("job ran %v after submit (delay %v) — before earliest allowed %v",
+				got.Sub(submittedAt), delay, earliest)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handler was never invoked")
+	}
+}

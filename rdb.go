@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,8 +20,9 @@ const defaultQueueName = "default"
 type Job struct {
 	JobBody
 
-	status string
-	qname  string
+	status  string
+	qname   string
+	retried int // number of retries so far; persisted in the job hash
 }
 
 // JobBody is the serialized form of a Job's exported fields, stored as the
@@ -66,18 +68,21 @@ func retryKey(qname string) string     { return fmt.Sprintf(keyStatusRetry, qnam
 
 const statsTTL = 90 * 24 * time.Hour // 90 days
 
-// leaseDuration is the default lease duration of a running job; once it
-// expires, the job can be recovered and re-scheduled by a recovery process.
-const leaseDuration = 30 * time.Second // 30s
+// defaultLeaseDuration is the default lease duration of a running job; once
+// it expires, the job can be recovered and re-scheduled by the recovery loop.
+const defaultLeaseDuration = 30 * time.Second
 
 // RDB wraps a redis client and implements the task persistence layer.
 // Embedding the interface promotes all redis methods onto b.
 type RDB struct {
 	client redis.UniversalClient
+	// leaseDuration is the running-job lease duration (F12). It is
+	// configurable so tests can use a short lease instead of waiting 30s.
+	leaseDuration time.Duration
 }
 
 func NewRDB(client redis.UniversalClient) *RDB {
-	return &RDB{client: client}
+	return &RDB{client: client, leaseDuration: defaultLeaseDuration}
 }
 
 // enqueue adds the given task to the pending list of the queue.
@@ -139,7 +144,7 @@ return 1
 	keys := []string{
 		fmt.Sprintf(keyJob, qname, jobID),
 		pendingKey(qname),
-	        scheduledKey(qname),
+		scheduledKey(qname),
 	}
 	argv := []interface{}{
 		jobID.String(),
@@ -192,7 +197,7 @@ return redis.call("HGETALL", job_key)
 	}
 	argv := []interface{}{
 		fmt.Sprintf(keyJob, qname, ""), // job key prefix, id is appended by the script
-		time.Now().Add(leaseDuration).Unix(),
+		time.Now().Add(r.leaseDuration).Unix(),
 		fieldStatus,
 		StatusRunning.String(),
 		fieldPendingSince,
@@ -283,14 +288,59 @@ return "OK"
 	return nil
 }
 
+// markAsRetry moves a job from running to the retry zset, scheduled for
+// nextRetryAt, and increments its retried counter. Atomic in one script.
+func (r *RDB) markAsRetry(ctx context.Context, job *Job, nextRetryAt time.Time) error {
+	script := redis.NewScript(`
+local running_queue = KEYS[1]
+local retry_queue   = KEYS[2]
+local job_key       = KEYS[3]
+
+local job_id          = ARGV[1]
+local next_retry_at   = ARGV[2] -- score = time of the next retry
+local field_status    = ARGV[3]
+local retry_status    = ARGV[4]
+local field_retried   = ARGV[5]
+
+if redis.call("ZREM", running_queue, job_id) == 0 then
+  return redis.error_reply("NOT FOUND")
+end
+redis.call("ZADD", retry_queue, next_retry_at, job_id)
+redis.call("HSET", job_key, field_status, retry_status)
+redis.call("HINCRBY", job_key, field_retried, 1)
+return "OK"
+`)
+	keys := []string{
+		runningKey(job.qname),
+		retryKey(job.qname),
+		jobKey(job),
+	}
+	args := []interface{}{
+		job.ID.String(),
+		nextRetryAt.Unix(),
+		fieldStatus,
+		StatusRetry.String(),
+		fieldRetried,
+	}
+	cmd := script.Run(ctx, r.client, keys, args...)
+	if err := cmd.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
 // forwardBatchSize caps how many delayed jobs a single forward call moves,
 // so one Lua script can't monopolize Redis when a large backlog becomes due.
 const forwardBatchSize = 100
 
+// recoverBatchSize caps how many expired leases a single recover call moves,
+// for the same reason: one Lua script must not monopolize Redis.
+const recoverBatchSize = 100
+
 // forward moves tasks whose scheduled/retry time (the zset score) has arrived
 // from the delayed zsets into the pending list, where workers can dequeue them.
 // It returns how many jobs were moved.
-func (r *RDB) forward(ctx context.Context, qname string) (int64, error) {
+func (r *RDB) forward(ctx context.Context, qname string) (n int64, err error) {
 	script := redis.NewScript(`
 local scheduled_queue = KEYS[1]
 local retry_queue     = KEYS[2]
@@ -341,6 +391,115 @@ return moved
 	return script.Run(ctx, r.client, keys, argv...).Int64()
 }
 
+// tryMoveJobScript atomically moves one running job to a target queue if
+// and only if its current running score still equals expectedScore. The score
+// works like a version: if the job was already recovered, completed, or
+// re-enqueued with a new lease, the score differs and the script does nothing.
+// Redis executes the whole script atomically, so the check and the move cannot
+// be interleaved by another client.
+var tryMoveJobScript = redis.NewScript(`
+-- KEYS[1]: running queue key
+-- KEYS[2]: target queue key (retry or failed)
+-- KEYS[3]: job hash key
+-- ARGV[1]: job id
+-- ARGV[2]: expected running score (the score the caller read earlier)
+-- ARGV[3]: target score
+-- ARGV[4]: new status
+-- ARGV[5]: error message (empty string if none)
+-- ARGV[6]: "1" to increment retried, "0" otherwise
+
+local job_id         = ARGV[1]
+local expected_score = tonumber(ARGV[2])
+
+local current_score = redis.call("ZSCORE", KEYS[1], job_id)
+if not current_score or tonumber(current_score) ~= expected_score then
+  return 0
+end
+
+redis.call("ZREM", KEYS[1], job_id)
+redis.call("ZADD", KEYS[2], tonumber(ARGV[3]), job_id)
+
+if ARGV[6] == "1" then
+  redis.call("HINCRBY", KEYS[3], "retried", 1)
+end
+redis.call("HSET", KEYS[3], "status", ARGV[4])
+if ARGV[5] ~= "" then
+  redis.call("HSET", KEYS[3], "error", ARGV[5])
+end
+
+return 1
+`)
+
+// recover reclaims running jobs whose lease has expired (running zset score <= now).
+//
+// It follows the same structure as asynq's recoverer, but with one stricter
+// guard:
+//  1. read expired job IDs and their current scores from the running zset;
+//  2. for each job, load it and decide retry vs final failure in Go;
+//  3. apply the decision with tryMoveJobScript, which verifies that the
+//     running score is still exactly the score we read before moving it.
+//
+// The retry path increments the retried counter and applies the same backoff
+// as settle. The failure path writes "lease expired": the worker is dead, so
+// the recoverer writes its own reason rather than a handler error.
+func (r *RDB) recover(ctx context.Context, qname string) (n int64, err error) {
+	now := time.Now().Unix()
+	zs, err := r.client.ZRangeByScoreWithScores(ctx, runningKey(qname), &redis.ZRangeBy{
+		Min:   "-inf",
+		Max:   strconv.FormatInt(now, 10),
+		Count: recoverBatchSize,
+	}).Result()
+	if err != nil {
+		return 0, err
+	}
+
+	for _, z := range zs {
+		jobID := z.Member.(string)
+		expectedScore := int64(z.Score)
+
+		fields, err := r.client.HGetAll(ctx, fmt.Sprintf(keyJob, qname, jobID)).Result()
+		if err != nil {
+			continue // single-key read error; next recovery pass will retry
+		}
+		job, err := decodeJob(qname, fields)
+		if err != nil {
+			continue // job hash is gone or malformed; nothing to recover
+		}
+
+		var targetQueueKey string
+		var targetScore int64
+		var newStatus string
+		var errorMsg string
+		incrRetried := false
+
+		if job.Opts.MaxRetries > 0 && job.retried < job.Opts.MaxRetries {
+			targetQueueKey = retryKey(qname)
+			targetScore = time.Now().Add(backoff(job.retried)).Unix()
+			newStatus = StatusRetry.String()
+			incrRetried = true
+		} else {
+			targetQueueKey = failedKey(qname)
+			targetScore = now
+			newStatus = StatusFailed.String()
+			errorMsg = "lease expired"
+		}
+
+		argv := []interface{}{jobID, expectedScore, targetScore, newStatus, errorMsg, "0"}
+		if incrRetried {
+			argv[5] = "1"
+		}
+		res, err := tryMoveJobScript.Run(ctx, r.client,
+			[]string{runningKey(qname), targetQueueKey, fmt.Sprintf(keyJob, qname, jobID)},
+			argv...).Int()
+		if err != nil {
+			return n, err
+		}
+		if res == 1 {
+			n++
+		}
+	}
+	return n, nil
+}
 
 // decodeJob translates from hash field in redis (tq:{<qname>}:job:<id>) to Job struct.
 func decodeJob(qname string, fields map[string]string) (*Job, error) {
@@ -352,9 +511,11 @@ func decodeJob(qname string, fields map[string]string) (*Job, error) {
 	if err := json.Unmarshal([]byte(body), &jb); err != nil {
 		return nil, err
 	}
+	retried, _ := strconv.Atoi(fields[fieldRetried])
 	return &Job{
 		JobBody: jb,
 		status:  fields[fieldStatus],
 		qname:   qname,
+		retried: retried,
 	}, nil
 }
