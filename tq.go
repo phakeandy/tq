@@ -159,11 +159,14 @@ func runJob(ctx context.Context, job *Job, handle Handle) (err error) {
 	return handle(jobCtx, job)
 }
 
-// settle is the policy decision point after one execution attempt: it decides
+// settle is the policy decision point after one executctx.Err() != nilion attempt: it decides
 // the job's next state and persists it. On success the job is completed; on
 // failure it is either scheduled for a retry with exponential backoff (while
 // attempts remain) or marked as finally failed.
 func settle(ctx context.Context, rdb *RDB, job *Job, runErr error) {
+	if ctx.Err() != nil {
+		return
+	}
 	if runErr != nil {
 		reason := runErr.Error()
 		// Retry while attempts remain, with exponential backoff
@@ -186,18 +189,6 @@ func settle(ctx context.Context, rdb *RDB, job *Job, runErr error) {
 		slog.Error("markAsCompleted failed after retries",
 			"job_id", job.ID, "type", job.Type, "error", err)
 	}
-}
-
-const maxBackoff = 30 * time.Second
-
-// backoff returns the wait before retry number retried (0-based), doubling
-// each time: 1s, 2s, 4s, ...
-func backoff(retried int) time.Duration {
-	d := time.Duration(1<<retried) * time.Second
-	if d > maxBackoff {
-		return maxBackoff
-	}
-	return d
 }
 
 func workerLoop(ctx context.Context, wg *sync.WaitGroup, rdb *RDB, handlemap H) {
@@ -293,3 +284,17 @@ func retry(attempts int, fn func() error) error {
 	}
 	return err
 }
+
+
+const maxBackoff = 30 * time.Second
+
+// backoff returns the wait before retry number retried (0-based), doubling
+// each time: 1s, 2s, 4s, ...
+func backoff(retried int) time.Duration {
+	d := time.Duration(1<<retried) * time.Second
+	if d > maxBackoff {
+		return maxBackoff
+	}
+	return d
+}
+

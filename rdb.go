@@ -11,30 +11,22 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// RDB wraps a redis client and implements the task persistence layer.
+// Embedding the interface promotes all redis methods onto b.
+type RDB struct {
+	client redis.UniversalClient
+
+	// leaseDuration is the running-job lease duration (F12). It is
+	// configurable so tests can use a short lease instead of waiting 30s.
+	leaseDuration time.Duration
+}
+
+func NewRDB(client redis.UniversalClient) *RDB {
+	return &RDB{client: client, leaseDuration: defaultLeaseDuration}
+}
+
 // defaultQueueName is the name of the queue this broker serves.
 const defaultQueueName = "default"
-
-// Job is a live task: the runtime instance created when a task is enqueued.
-// A worker receives a Job and reads the task definition (Type, Payload) plus
-// its runtime identity (ID).
-type Job struct {
-	JobBody
-
-	status  string
-	qname   string
-	retried int // number of retries so far; persisted in the job hash
-}
-
-// JobBody is the serialized form of a Job's exported fields, stored as the
-// "body" field of the job hash.
-//
-// A worker unmarshals it back into a Job after dequeue.
-type JobBody struct {
-	ID      uuid.UUID `json:"id"`
-	Type    string    `json:"type"`
-	Payload []byte    `json:"payload"`
-	Opts    options   `json:"opts"`
-}
 
 // tq:{%s}:job:%s hash type's fields
 const (
@@ -71,19 +63,6 @@ const statsTTL = 90 * 24 * time.Hour // 90 days
 // defaultLeaseDuration is the default lease duration of a running job; once
 // it expires, the job can be recovered and re-scheduled by the recovery loop.
 const defaultLeaseDuration = 30 * time.Second
-
-// RDB wraps a redis client and implements the task persistence layer.
-// Embedding the interface promotes all redis methods onto b.
-type RDB struct {
-	client redis.UniversalClient
-	// leaseDuration is the running-job lease duration (F12). It is
-	// configurable so tests can use a short lease instead of waiting 30s.
-	leaseDuration time.Duration
-}
-
-func NewRDB(client redis.UniversalClient) *RDB {
-	return &RDB{client: client, leaseDuration: defaultLeaseDuration}
-}
 
 // enqueue adds the given task to the pending list of the queue.
 func (r *RDB) enqueue(ctx context.Context, qname string, t *Task) error {
@@ -212,6 +191,7 @@ return redis.call("HGETALL", job_key)
 	}
 	return decodeJob(qname, fields)
 }
+
 func (r *RDB) markAsCompleted(ctx context.Context, job *Job) error {
 	script := redis.NewScript(`
 local running_queue    = KEYS[1]
@@ -499,23 +479,4 @@ func (r *RDB) recover(ctx context.Context, qname string) (n int64, err error) {
 		}
 	}
 	return n, nil
-}
-
-// decodeJob translates from hash field in redis (tq:{<qname>}:job:<id>) to Job struct.
-func decodeJob(qname string, fields map[string]string) (*Job, error) {
-	body, ok := fields[fieldBody]
-	if !ok {
-		return nil, fmt.Errorf("decodeJob: missing field %q", fieldBody)
-	}
-	var jb JobBody
-	if err := json.Unmarshal([]byte(body), &jb); err != nil {
-		return nil, err
-	}
-	retried, _ := strconv.Atoi(fields[fieldRetried])
-	return &Job{
-		JobBody: jb,
-		status:  fields[fieldStatus],
-		qname:   qname,
-		retried: retried,
-	}, nil
 }
