@@ -371,52 +371,13 @@ return moved
 	return script.Run(ctx, r.client, keys, argv...).Int64()
 }
 
-// tryMoveJobScript atomically moves one running job to a target queue if
-// and only if its current running score still equals expectedScore. The score
-// works like a version: if the job was already recovered, completed, or
-// re-enqueued with a new lease, the score differs and the script does nothing.
-// Redis executes the whole script atomically, so the check and the move cannot
-// be interleaved by another client.
-var tryMoveJobScript = redis.NewScript(`
--- KEYS[1]: running queue key
--- KEYS[2]: target queue key (retry or failed)
--- KEYS[3]: job hash key
--- ARGV[1]: job id
--- ARGV[2]: expected running score (the score the caller read earlier)
--- ARGV[3]: target score
--- ARGV[4]: new status
--- ARGV[5]: error message (empty string if none)
--- ARGV[6]: "1" to increment retried, "0" otherwise
-
-local job_id         = ARGV[1]
-local expected_score = tonumber(ARGV[2])
-
-local current_score = redis.call("ZSCORE", KEYS[1], job_id)
-if not current_score or tonumber(current_score) ~= expected_score then
-  return 0
-end
-
-redis.call("ZREM", KEYS[1], job_id)
-redis.call("ZADD", KEYS[2], tonumber(ARGV[3]), job_id)
-
-if ARGV[6] == "1" then
-  redis.call("HINCRBY", KEYS[3], "retried", 1)
-end
-redis.call("HSET", KEYS[3], "status", ARGV[4])
-if ARGV[5] ~= "" then
-  redis.call("HSET", KEYS[3], "error", ARGV[5])
-end
-
-return 1
-`)
-
 // recover reclaims running jobs whose lease has expired (running zset score <= now).
 //
 // It follows the same structure as asynq's recoverer, but with one stricter
 // guard:
 //  1. read expired job IDs and their current scores from the running zset;
 //  2. for each job, load it and decide retry vs final failure in Go;
-//  3. apply the decision with tryMoveJobScript, which verifies that the
+//  3. apply the decision with an inline CAS script, which verifies that the
 //     running score is still exactly the score we read before moving it.
 //
 // The retry path increments the retried counter and applies the same backoff
@@ -432,6 +393,46 @@ func (r *RDB) recover(ctx context.Context, qname string) (n int64, err error) {
 	if err != nil {
 		return 0, err
 	}
+
+	// CAS script: moves one running job to a target queue (retry or failed)
+	// only if its running score still equals the score read above. The score
+	// works like a version — if the job was already recovered, completed, or
+	// re-enqueued with a new lease, the score differs and the move is a no-op.
+	// Redis executes the whole script atomically, so the check and the move
+	// cannot be interleaved by another client.
+	script := redis.NewScript(`
+local running_queue = KEYS[1]
+local target_queue  = KEYS[2]
+local job_key       = KEYS[3]
+
+local job_id         = ARGV[1]
+local expected_score = tonumber(ARGV[2])
+local target_score   = tonumber(ARGV[3])
+local new_status     = ARGV[4]
+local error_msg      = ARGV[5]
+local incr_retried   = ARGV[6] -- "1" to increment retried, "0" otherwise
+local field_retried  = ARGV[7]
+local field_status   = ARGV[8]
+local field_error    = ARGV[9]
+
+local current_score = redis.call("ZSCORE", running_queue, job_id)
+if not current_score or tonumber(current_score) ~= expected_score then
+  return 0
+end
+
+redis.call("ZREM", running_queue, job_id)
+redis.call("ZADD", target_queue, target_score, job_id)
+
+if incr_retried == "1" then
+  redis.call("HINCRBY", job_key, field_retried, 1)
+end
+redis.call("HSET", job_key, field_status, new_status)
+if error_msg ~= "" then
+  redis.call("HSET", job_key, field_error, error_msg)
+end
+
+return 1
+`)
 
 	for _, z := range zs {
 		jobID := z.Member.(string)
@@ -450,13 +451,13 @@ func (r *RDB) recover(ctx context.Context, qname string) (n int64, err error) {
 		var targetScore int64
 		var newStatus string
 		var errorMsg string
-		incrRetried := false
+		incrRetried := "0"
 
 		if job.Opts.MaxRetries > 0 && job.retried < job.Opts.MaxRetries {
 			targetQueueKey = retryKey(qname)
 			targetScore = time.Now().Add(backoff(job.retried)).Unix()
 			newStatus = StatusRetry.String()
-			incrRetried = true
+			incrRetried = "1"
 		} else {
 			targetQueueKey = failedKey(qname)
 			targetScore = now
@@ -464,13 +465,23 @@ func (r *RDB) recover(ctx context.Context, qname string) (n int64, err error) {
 			errorMsg = "lease expired"
 		}
 
-		argv := []interface{}{jobID, expectedScore, targetScore, newStatus, errorMsg, "0"}
-		if incrRetried {
-			argv[5] = "1"
+		keys := []string{
+			runningKey(qname),
+			targetQueueKey,
+			fmt.Sprintf(keyJob, qname, jobID),
 		}
-		res, err := tryMoveJobScript.Run(ctx, r.client,
-			[]string{runningKey(qname), targetQueueKey, fmt.Sprintf(keyJob, qname, jobID)},
-			argv...).Int()
+		argv := []interface{}{
+			jobID,
+			expectedScore,
+			targetScore,
+			newStatus,
+			errorMsg,
+			incrRetried,
+			fieldRetried,
+			fieldStatus,
+			fieldError,
+		}
+		res, err := script.Run(ctx, r.client, keys, argv...).Int()
 		if err != nil {
 			return n, err
 		}

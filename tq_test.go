@@ -205,7 +205,7 @@ func TestRunHandlerPanic(t *testing.T) {
 // ──────────────────────────── retry (F4) ────────────────────────────
 
 // TestBackoff verifies the exponential backoff schedule from PRD F4:
-// 1s, 2s, 4s, ... after the 1st, 2nd, 3rd failure.
+// 1s, 2s, 4s, ... after the 1st, 2nd, 3rd failure, capped at maxBackoff.
 func TestBackoff(t *testing.T) {
 	cases := []struct {
 		retried int
@@ -215,6 +215,7 @@ func TestBackoff(t *testing.T) {
 		{1, 2 * time.Second},
 		{2, 4 * time.Second},
 		{3, 8 * time.Second},
+		{10, maxBackoff}, // 2^10s would be 1024s; the cap must kick in
 	}
 	for _, c := range cases {
 		if got := backoff(c.retried); got != c.want {
