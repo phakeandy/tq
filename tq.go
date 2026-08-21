@@ -2,6 +2,7 @@ package tq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -86,7 +87,6 @@ func defaultOptions() options {
 
 // WithMaxRetries sets the maximum number of retries on failure.
 // Not calling it uses the default (3). 0 means no retries at all.
-// TODO(F4): retry logic not yet implemented; field is reserved.
 func WithMaxRetries(n int) Option {
 	return func(o *options) { o.MaxRetries = n }
 }
@@ -99,7 +99,6 @@ func WithIdempotencyKey(k string) Option {
 }
 
 // WithDelay postpones execution by this duration. Zero means immediate execution.
-// TODO(F3): delayed execution not yet implemented; field is reserved.
 func WithDelay(d time.Duration) Option {
 	return func(o *options) { o.Delay = d }
 }
@@ -131,15 +130,68 @@ func Run(ctx context.Context, rdb *RDB, handlemap H, concurrency int) error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(concurrency)
+	wg.Add(concurrency + 2)
 	for i := 0; i < concurrency; i++ {
-		go processJob(ctx, &wg, rdb, handlemap)
+		go workerLoop(ctx, &wg, rdb, handlemap)
 	}
+	go forwardLoop(ctx, &wg, rdb)
+	go recoveryLoop(ctx, &wg, rdb)
 	wg.Wait()
 	return nil
 }
 
-func processJob(ctx context.Context, wg *sync.WaitGroup, rdb *RDB, handlemap H) {
+var errNoHandler = errors.New("no handler for task type")
+
+// runJob runs one job's handler with the job's timeout policy.
+// Panics from the handler are converted to errors. It does no queue
+// bookkeeping, so it can be tested with fake handlers, no backend needed.
+func runJob(ctx context.Context, job *Job, handle Handle) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	if job.Opts.Timeout <= 0 {
+		return handle(ctx, job)
+	}
+	jobCtx, cancel := context.WithTimeout(ctx, job.Opts.Timeout)
+	defer cancel()
+	return handle(jobCtx, job)
+}
+
+// settle is the policy decision point after one executctx.Err() != nilion attempt: it decides
+// the job's next state and persists it. On success the job is completed; on
+// failure it is either scheduled for a retry with exponential backoff (while
+// attempts remain) or marked as finally failed.
+func settle(ctx context.Context, rdb *RDB, job *Job, runErr error) {
+	if ctx.Err() != nil {
+		return
+	}
+	if runErr != nil {
+		reason := runErr.Error()
+		// Retry while attempts remain, with exponential backoff
+		if job.Opts.MaxRetries > 0 && job.retried < job.Opts.MaxRetries {
+			next := time.Now().Add(backoff(job.retried))
+			if err := retry(3, func() error { return rdb.markAsRetry(ctx, job, next) }); err != nil {
+				slog.Error("markAsRetry failed after retries",
+					"job_id", job.ID, "type", job.Type, "error", err)
+			}
+			return
+		}
+		// Retries exhausted: final failure.
+		if err := retry(3, func() error { return rdb.markAsFailed(ctx, job, reason) }); err != nil {
+			slog.Error("markAsFailed failed after retries",
+				"job_id", job.ID, "type", job.Type, "reason", reason, "error", err)
+		}
+		return
+	}
+	if err := retry(3, func() error { return rdb.markAsCompleted(ctx, job) }); err != nil {
+		slog.Error("markAsCompleted failed after retries",
+			"job_id", job.ID, "type", job.Type, "error", err)
+	}
+}
+
+func workerLoop(ctx context.Context, wg *sync.WaitGroup, rdb *RDB, handlemap H) {
 	defer wg.Done()
 	for {
 		select {
@@ -149,54 +201,75 @@ func processJob(ctx context.Context, wg *sync.WaitGroup, rdb *RDB, handlemap H) 
 		}
 		job, err := rdb.dequeue(ctx, defaultQueueName) // TODO: now use only defaultQueueName
 		if err != nil {
-			time.Sleep(200 * time.Millisecond)
-			continue
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(200 * time.Millisecond):
+				continue
+			}
 		}
-
 		handle, ok := handlemap[job.Type]
 		if !ok {
-			if retryErr := retry(3, func() error {
-				return rdb.markAsFailed(ctx, job, "no handler for task type")
-			}); retryErr != nil {
-				slog.Error("markAsFailed (no handler) failed after retries",
-					"job_id", job.ID, "type", job.Type, "error", retryErr)
-			}
+			settle(ctx, rdb, job, errNoHandler)
 			continue
 		}
+		settle(ctx, rdb, job, runJob(ctx, job, handle))
+	}
+}
 
-		if err := func() (err error) {
-			var (
-				jobCtx context.Context
-				cancel context.CancelFunc
-			)
-			if job.Opts.Timeout > 0 {
-				jobCtx, cancel = context.WithTimeout(ctx, job.Opts.Timeout)
-				defer cancel()
-			} else {
-				jobCtx = ctx
+// forwardLoop launches a loop that forwards every second.
+func forwardLoop(ctx context.Context, wg *sync.WaitGroup, rdb *RDB) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(1 * time.Second):
+		}
+		for {
+			var n int64
+			err := retry(3, func() error {
+				var ferr error
+				n, ferr = rdb.forward(ctx, defaultQueueName)
+				return ferr
+			})
+			if err != nil {
+				slog.Error("forward failed after retries", "error", err)
+				break
 			}
+			if n == forwardBatchSize {
+				continue
+			}
+			break
+		}
+	}
+}
 
-			defer func() {
-				if r := recover(); r != nil {
-					err = fmt.Errorf("panic: %v", r) // if handle panic, transform it to an error
-				}
-			}()
-
-			return handle(jobCtx, job)
-		}(); err != nil {
-			if retryErr := retry(3, func() error {
-				return rdb.markAsFailed(ctx, job, err.Error())
-			}); retryErr != nil {
-				slog.Error("markAsFailed after handler error failed after retries",
-					"job_id", job.ID, "type", job.Type, "handler_error", err, "error", retryErr)
+// recoveryLoop periodically reclaims jobs whose running lease has expired.
+// It runs every second, so recovery latency is roughly leaseDuration + 1s.
+func recoveryLoop(ctx context.Context, wg *sync.WaitGroup, rdb *RDB) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(1 * time.Second):
+		}
+		for {
+			var n int64
+			err := retry(3, func() error {
+				var ferr error
+				n, ferr = rdb.recover(ctx, defaultQueueName)
+				return ferr
+			})
+			if err != nil {
+				slog.Error("recover failed after retries", "error", err)
+				break
 			}
-		} else {
-			if retryErr := retry(3, func() error {
-				return rdb.markAsCompleted(ctx, job)
-			}); retryErr != nil {
-				slog.Error("markAsCompleted failed after retries",
-					"job_id", job.ID, "type", job.Type, "error", retryErr)
+			if n == recoverBatchSize {
+				continue
 			}
+			break
 		}
 	}
 }
@@ -211,3 +284,17 @@ func retry(attempts int, fn func() error) error {
 	}
 	return err
 }
+
+
+const maxBackoff = 30 * time.Second
+
+// backoff returns the wait before retry number retried (0-based), doubling
+// each time: 1s, 2s, 4s, ...
+func backoff(retried int) time.Duration {
+	d := time.Duration(1<<retried) * time.Second
+	if d > maxBackoff {
+		return maxBackoff
+	}
+	return d
+}
+

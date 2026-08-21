@@ -10,8 +10,8 @@ stateDiagram-v2
     running --> failed: handler 返回 error
 
     note right of waiting
-        F3 延迟执行: Delay 字段已定义但未消费
-        未来: 提交后先进 zset 延迟队列
+        F3 延迟执行(已实现): WithDelay 任务入队先进 scheduled zset
+        forwardLoop 每 1s 把到期任务搬进 pending，再被 worker 拉取
     end note
 
     note right of running
@@ -63,7 +63,6 @@ sequenceDiagram
 | 功能 | 依赖的基础设施 | 图上的位置 |
 |------|---------------|-----------|
 | F4 重试 | zset 延迟队列 + MaxRetries 计数 | failed → waiting 虚线 |
-| F3 延迟执行 | 同一个 zset 延迟队列 | waiting 之前 |
 | F8 超时强制终止 | 超时后强制标 failed | running 状态 |
 | F9 故障隔离 | handler panic recover | running 状态 |
 | F11 可观测 | metrics 采集 | 全部状态 |
