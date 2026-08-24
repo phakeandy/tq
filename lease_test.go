@@ -253,15 +253,15 @@ func TestRunRecoverExpiredLease(t *testing.T) {
 	r := NewRDB(client)
 	r.leaseDuration = 50 * time.Millisecond
 
-	jobKey := enqueueTask(t, r, client,
+	jobKey := enqueueTask(t, r,
 		NewTask("stuck:task", []byte(`{}`), WithMaxRetries(1), WithTimeout(0)))
 
 	// The handler blocks until the whole Run is cancelled, which is much
 	// longer than the 50ms lease: from the lease's point of view this worker
 	// is dead (a real crash would never return either).
-	handler := func(ctx context.Context, j *Job) error {
+	handler := func(ctx context.Context, j *Job) ([]byte, error) {
 		<-ctx.Done()
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 	// concurrency=2: one worker is stuck in the first attempt while another
 	// worker must be available to pick up the retry after it is recovered.

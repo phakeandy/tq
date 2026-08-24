@@ -21,16 +21,16 @@ func TestRun(t *testing.T) {
 	client := testutil.SetupRedis(t)
 	r := NewRDB(client)
 
-	sendEmail := func(ctx context.Context, job *Job) error {
+	sendEmail := func(ctx context.Context, job *Job) ([]byte, error) {
 		var p struct {
 			From string `json:"from"`
 			To   string `json:"to"`
 		}
 		if err := json.Unmarshal(job.Payload, &p); err != nil {
-			return err
+			return nil, err
 		}
 		fmt.Printf("Send a email from: %v, to: %v\n", p.From, p.To)
-		return nil
+		return nil, nil
 	}
 
 	h := H{
@@ -86,16 +86,13 @@ func waitTerminal(t *testing.T, client redis.UniversalClient, key string, timeou
 }
 
 // enqueueTask enqueues a task and returns the Redis key of the resulting job.
-func enqueueTask(t *testing.T, r *RDB, client redis.UniversalClient, task *Task) string {
+func enqueueTask(t *testing.T, r *RDB, task *Task) string {
 	t.Helper()
-	if err := r.enqueue(context.Background(), defaultQueueName, task); err != nil {
+	res, err := r.enqueue(context.Background(), defaultQueueName, task)
+	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	pending := testutil.GetList(t, client, pendingKey(defaultQueueName))
-	if len(pending) != 1 {
-		t.Fatalf("pending list has %d entries, want 1", len(pending))
-	}
-	return fmt.Sprintf(keyJob, defaultQueueName, pending[0])
+	return fmt.Sprintf(keyJob, defaultQueueName, res.ID)
 }
 
 // TestRunDefaultTimeoutReachesWorker verifies the default-value chain: a task
@@ -105,12 +102,12 @@ func TestRunDefaultTimeoutReachesWorker(t *testing.T) {
 	client := testutil.SetupRedis(t)
 	r := NewRDB(client)
 
-	jobKey := enqueueTask(t, r, client, NewTask("echo:task", []byte(`{}`)))
+	jobKey := enqueueTask(t, r, NewTask("echo:task", []byte(`{}`)))
 
 	gotTimeout := make(chan time.Duration, 1)
-	handler := func(ctx context.Context, j *Job) error {
+	handler := func(ctx context.Context, j *Job) ([]byte, error) {
 		gotTimeout <- j.Opts.Timeout
-		return nil
+		return nil, nil
 	}
 	startRun(t, r, H{"echo:task": handler}, 1)
 
@@ -134,11 +131,11 @@ func TestRunHandlerError(t *testing.T) {
 	client := testutil.SetupRedis(t)
 	r := NewRDB(client)
 
-	jobKey := enqueueTask(t, r, client,
+	jobKey := enqueueTask(t, r,
 		NewTask("fail:task", []byte(`{}`), WithMaxRetries(0)))
 
-	fail := func(ctx context.Context, j *Job) error {
-		return errors.New("boom")
+	fail := func(ctx context.Context, j *Job) ([]byte, error) {
+		return nil, errors.New("boom")
 	}
 	startRun(t, r, H{"fail:task": fail}, 1)
 
@@ -157,9 +154,9 @@ func TestRunNoHandler(t *testing.T) {
 	client := testutil.SetupRedis(t)
 	r := NewRDB(client)
 
-	jobKey := enqueueTask(t, r, client, NewTask("nobody:home", []byte(`{}`), WithMaxRetries(0)))
+	jobKey := enqueueTask(t, r, NewTask("nobody:home", []byte(`{}`), WithMaxRetries(0)))
 
-	startRun(t, r, H{"some:other": func(ctx context.Context, j *Job) error { return nil }}, 1)
+	startRun(t, r, H{"some:other": func(ctx context.Context, j *Job) ([]byte, error) { return nil, nil }}, 1)
 
 	fields := waitTerminal(t, client, jobKey, 3*time.Second)
 	if got := fields[fieldStatus]; got != StatusFailed.String() {
@@ -176,14 +173,14 @@ func TestRunHandlerPanic(t *testing.T) {
 	client := testutil.SetupRedis(t)
 	r := NewRDB(client)
 
-	boom := func(ctx context.Context, j *Job) error {
+	boom := func(ctx context.Context, j *Job) ([]byte, error) {
 		panic("kaboom")
 	}
-	ok := func(ctx context.Context, j *Job) error { return nil }
+	ok := func(ctx context.Context, j *Job) ([]byte, error) { return nil, nil }
 	startRun(t, r, H{"panic:task": boom, "ok:task": ok}, 1)
 
 	// First job: handler panics, must end up failed with the panic message.
-	panicKey := enqueueTask(t, r, client,
+	panicKey := enqueueTask(t, r,
 		NewTask("panic:task", []byte(`{}`), WithMaxRetries(0)))
 	fields := waitTerminal(t, client, panicKey, 3*time.Second)
 	if got := fields[fieldStatus]; got != StatusFailed.String() {
@@ -194,7 +191,7 @@ func TestRunHandlerPanic(t *testing.T) {
 	}
 
 	// Second job: same worker (concurrency=1) must still be alive and complete it.
-	okKey := enqueueTask(t, r, client, NewTask("ok:task", []byte(`{}`)))
+	okKey := enqueueTask(t, r, NewTask("ok:task", []byte(`{}`)))
 	fields = waitTerminal(t, client, okKey, 3*time.Second)
 	if got := fields[fieldStatus]; got != StatusCompleted.String() {
 		t.Fatalf("worker died after panic: second job status = %q, want %q",
@@ -231,14 +228,14 @@ func TestRunRetryThenSuccess(t *testing.T) {
 	r := NewRDB(client)
 
 	var attempts atomic.Int32
-	flaky := func(ctx context.Context, j *Job) error {
+	flaky := func(ctx context.Context, j *Job) ([]byte, error) {
 		if attempts.Add(1) == 1 {
-			return errors.New("first attempt fails")
+			return nil, errors.New("first attempt fails")
 		}
-		return nil
+		return nil, nil
 	}
 
-	jobKey := enqueueTask(t, r, client,
+	jobKey := enqueueTask(t, r,
 		NewTask("flaky:task", []byte(`{}`), WithMaxRetries(1)))
 	startRun(t, r, H{"flaky:task": flaky}, 1)
 
@@ -261,10 +258,10 @@ func TestRunRetryExhaustion(t *testing.T) {
 	client := testutil.SetupRedis(t)
 	r := NewRDB(client)
 
-	jobKey := enqueueTask(t, r, client,
+	jobKey := enqueueTask(t, r,
 		NewTask("fail:task", []byte(`{}`), WithMaxRetries(1)))
 
-	fail := func(ctx context.Context, j *Job) error { return errors.New("always fails") }
+	fail := func(ctx context.Context, j *Job) ([]byte, error) { return nil, errors.New("always fails") }
 	startRun(t, r, H{"fail:task": fail}, 1)
 
 	fields := waitTerminal(t, client, jobKey, 8*time.Second)
@@ -285,10 +282,10 @@ func TestRunRetryZero(t *testing.T) {
 	client := testutil.SetupRedis(t)
 	r := NewRDB(client)
 
-	jobKey := enqueueTask(t, r, client,
+	jobKey := enqueueTask(t, r,
 		NewTask("fail:task", []byte(`{}`), WithMaxRetries(0)))
 
-	fail := func(ctx context.Context, j *Job) error { return errors.New("boom") }
+	fail := func(ctx context.Context, j *Job) ([]byte, error) { return nil, errors.New("boom") }
 	startRun(t, r, H{"fail:task": fail}, 1)
 
 	fields := waitTerminal(t, client, jobKey, 3*time.Second)
@@ -309,57 +306,58 @@ func TestRunRetryZero(t *testing.T) {
 // deadline-capped context: the handler blocks until cancellation and the
 // deadline error propagates.
 func TestRunJobTimeout(t *testing.T) {
-	handle := func(ctx context.Context, job *Job) error {
+	handle := func(ctx context.Context, job *Job) ([]byte, error) {
 		<-ctx.Done() // block until the timeout cancels the ctx
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 	job := &Job{JobBody: JobBody{Opts: options{Timeout: 10 * time.Millisecond}}}
 
-	err := runJob(context.Background(), job, handle)
+	result, err := runJob(context.Background(), job, handle)
 	if err != context.DeadlineExceeded {
 		t.Fatalf("got %v, want DeadlineExceeded", err)
+	}
+	if result != nil {
+		t.Errorf("result = %q, want nil on timeout", result)
 	}
 }
 
 // TestRunJobPanic verifies that a panicking handler is converted to an error.
 func TestRunJobPanic(t *testing.T) {
-	handle := func(ctx context.Context, job *Job) error { panic("boom") }
+	handle := func(ctx context.Context, job *Job) ([]byte, error) { panic("boom") }
 
-	err := runJob(context.Background(), &Job{}, handle)
+	_, err := runJob(context.Background(), &Job{}, handle)
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("got %v, want panic converted to error", err)
 	}
 }
 
-// TestRunJobSuccess verifies the plain path: nil error passes through,
-// and a zero Timeout means no deadline is applied.
+// TestRunJobSuccess verifies the plain path: nil error passes through, the
+// handler's result is returned, and a zero Timeout means no deadline is applied.
 func TestRunJobSuccess(t *testing.T) {
-	handle := func(ctx context.Context, job *Job) error {
+	handle := func(ctx context.Context, job *Job) ([]byte, error) {
 		if _, ok := ctx.Deadline(); ok {
-			return errors.New("expected no deadline for Timeout=0")
+			return nil, errors.New("expected no deadline for Timeout=0")
 		}
-		return nil
+		return []byte("done"), nil
 	}
 
-	if err := runJob(context.Background(), &Job{}, handle); err != nil {
+	result, err := runJob(context.Background(), &Job{}, handle)
+	if err != nil {
 		t.Fatalf("got %v, want nil", err)
+	}
+	if string(result) != "done" {
+		t.Errorf("result = %q, want %q", result, "done")
 	}
 }
 
-
 // enqueueDelayedTask enqueues a delayed task and returns its job key.
-// Unlike enqueueTask, it expects the job in the scheduled zset, not the
-// pending list — that is itself part of the F3 contract.
-func enqueueDelayedTask(t *testing.T, r *RDB, client redis.UniversalClient, task *Task) string {
+func enqueueDelayedTask(t *testing.T, r *RDB, task *Task) string {
 	t.Helper()
-	if err := r.enqueue(context.Background(), defaultQueueName, task); err != nil {
+	res, err := r.enqueue(context.Background(), defaultQueueName, task)
+	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	scheduled := testutil.GetZSet(t, client, scheduledKey(defaultQueueName))
-	if len(scheduled) != 1 {
-		t.Fatalf("scheduled zset has %d entries, want 1", len(scheduled))
-	}
-	return fmt.Sprintf(keyJob, defaultQueueName, scheduled[0].Member)
+	return fmt.Sprintf(keyJob, defaultQueueName, res.ID)
 }
 
 // TestRunDelayedTask verifies F3 end-to-end: a job submitted with WithDelay
@@ -375,14 +373,14 @@ func TestRunDelayedTask(t *testing.T) {
 	// scripts cannot truncate it into the "due now" branch of enqueue.
 	const delay = 2 * time.Second
 	submittedAt := time.Now()
-	jobKey := enqueueDelayedTask(t, r, client,
+	jobKey := enqueueDelayedTask(t, r,
 		NewTask("slow:task", []byte(`{}`), WithDelay(delay)))
 
 	// The handler records the wall-clock time it actually started.
 	executedAt := make(chan time.Time, 1)
-	handler := func(ctx context.Context, j *Job) error {
+	handler := func(ctx context.Context, j *Job) ([]byte, error) {
 		executedAt <- time.Now()
-		return nil
+		return nil, nil
 	}
 	startRun(t, r, H{"slow:task": handler}, 1)
 
@@ -405,5 +403,131 @@ func TestRunDelayedTask(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("handler was never invoked")
+	}
+}
+
+// ──────────────────────────── idempotency (F5) ────────────────────────────
+
+// TestRunIdempotentReject verifies F5 end-to-end: while a task with the key is
+// in flight, Enqueue refuses to create a second job (ErrDuplicateInFlight).
+func TestRunIdempotentReject(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	block := make(chan struct{})
+	handler := func(ctx context.Context, j *Job) ([]byte, error) {
+		<-block // hold the job in flight until the duplicate has been attempted
+		return []byte("done"), nil
+	}
+	startRun(t, r, H{"idem:task": handler}, 1)
+
+	first, err := Enqueue(context.Background(), r,
+		NewTask("idem:task", []byte(`{}`), WithIdempotencyKey("k1")))
+	if err != nil {
+		t.Fatalf("first Enqueue: %v", err)
+	}
+
+	_, err = Enqueue(context.Background(), r,
+		NewTask("idem:task", []byte(`{}`), WithIdempotencyKey("k1")))
+	if !errors.Is(err, ErrDuplicateInFlight) {
+		t.Fatalf("second Enqueue error = %v, want ErrDuplicateInFlight", err)
+	}
+
+	close(block) // let the job finish so Run can wind down cleanly
+	jobKey := fmt.Sprintf(keyJob, defaultQueueName, first.ID)
+	fields := waitTerminal(t, client, jobKey, 3*time.Second)
+	if got := fields[fieldStatus]; got != StatusCompleted.String() {
+		t.Fatalf("status = %q, want %q", got, StatusCompleted.String())
+	}
+	if got := fields[fieldResult]; got != "done" {
+		t.Errorf("result = %q, want %q (handler result must be stored)", got, "done")
+	}
+}
+
+// TestRunIdempotentDuplicateReturnsResult verifies F5 end-to-end: after a task
+// completes, re-submitting the same key returns the original job's ID and
+// stored result instead of creating a new job.
+func TestRunIdempotentDuplicateReturnsResult(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	handler := func(ctx context.Context, j *Job) ([]byte, error) {
+		return []byte(`{"ok":true}`), nil
+	}
+	startRun(t, r, H{"idem:task": handler}, 1)
+
+	first, err := Enqueue(context.Background(), r,
+		NewTask("idem:task", []byte(`{}`), WithIdempotencyKey("k2")))
+	if err != nil {
+		t.Fatalf("first Enqueue: %v", err)
+	}
+	firstKey := fmt.Sprintf(keyJob, defaultQueueName, first.ID)
+	fields := waitTerminal(t, client, firstKey, 3*time.Second)
+	if got := fields[fieldStatus]; got != StatusCompleted.String() {
+		t.Fatalf("status = %q, want %q", got, StatusCompleted.String())
+	}
+
+	dup, err := Enqueue(context.Background(), r,
+		NewTask("idem:task", []byte(`{}`), WithIdempotencyKey("k2")))
+	if err != nil {
+		t.Fatalf("duplicate Enqueue: %v", err)
+	}
+	if !dup.Duplicate {
+		t.Error("want Duplicate = true")
+	}
+	if dup.ID != first.ID {
+		t.Errorf("dup.ID = %v, want %v (the original job)", dup.ID, first.ID)
+	}
+	if string(dup.Result) != `{"ok":true}` {
+		t.Errorf("dup.Result = %q, want %q (the original result)", dup.Result, `{"ok":true}`)
+	}
+
+	// No second job was created.
+	if got := testutil.GetList(t, client, pendingKey(defaultQueueName)); len(got) != 0 {
+		t.Errorf("pending list has %d entries after duplicate Enqueue, want 0", len(got))
+	}
+}
+
+// TestRunIdempotentFailedDuplicate verifies F5 with a finally failed task:
+// the duplicate submission resolves to the original failure, never to a new
+// execution (PRD F1: same-key tasks execute at most once).
+func TestRunIdempotentFailedDuplicate(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+
+	handler := func(ctx context.Context, j *Job) ([]byte, error) {
+		return nil, errors.New("boom")
+	}
+	startRun(t, r, H{"idem:task": handler}, 1)
+
+	first, err := Enqueue(context.Background(), r,
+		NewTask("idem:task", []byte(`{}`), WithIdempotencyKey("k3"), WithMaxRetries(0)))
+	if err != nil {
+		t.Fatalf("first Enqueue: %v", err)
+	}
+	firstKey := fmt.Sprintf(keyJob, defaultQueueName, first.ID)
+	fields := waitTerminal(t, client, firstKey, 3*time.Second)
+	if got := fields[fieldStatus]; got != StatusFailed.String() {
+		t.Fatalf("status = %q, want %q", got, StatusFailed.String())
+	}
+
+	dup, err := Enqueue(context.Background(), r,
+		NewTask("idem:task", []byte(`{}`), WithIdempotencyKey("k3"), WithMaxRetries(0)))
+	if err != nil {
+		t.Fatalf("duplicate Enqueue: %v", err)
+	}
+	if !dup.Duplicate {
+		t.Error("want Duplicate = true")
+	}
+	if dup.ID != first.ID {
+		t.Errorf("dup.ID = %v, want %v (the original job)", dup.ID, first.ID)
+	}
+	if dup.ErrMsg != "boom" {
+		t.Errorf("dup.ErrMsg = %q, want %q (the original failure)", dup.ErrMsg, "boom")
+	}
+
+	// The handler ran exactly once: no second execution happened.
+	if got := testutil.GetZSet(t, client, failedKey(defaultQueueName)); len(got) != 1 {
+		t.Errorf("failed zset has %d entries, want 1", len(got))
 	}
 }

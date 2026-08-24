@@ -14,6 +14,15 @@ stateDiagram-v2
         forwardLoop 每 1s 把到期任务搬进 pending，再被 worker 拉取
     end note
 
+    note right of [*]
+        F5 幂等投递(已实现): WithIdempotencyKey 任务在提交时去重，
+        检查与建任务在同一个 Lua 脚本内原子完成(满足 N1 并发去重)。
+        同 key 未完成(pending/running/scheduled/retry) → 拒绝(ErrDuplicateInFlight)；
+        同 key 已完成(completed/failed) → 返回原 job 的结果/失败原因，不再建新任务。
+        索引: tq:{qname}:unique:{key} → jobID，TTL 默认 1h(可配置，对应 F13 结果保留期)。
+        Handler 结果随 markAsCompleted 写入 job hash 的 result 字段。
+    end note
+
     note right of running
         F8 超时: ctx.WithTimeout 已传入 handler
         但 handler 不理会 ctx 时无法强制中止(未实现)

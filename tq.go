@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Task represents a unit of work to be performed.
@@ -91,9 +93,11 @@ func WithMaxRetries(n int) Option {
 	return func(o *options) { o.MaxRetries = n }
 }
 
-// WithIdempotencyKey ensures tasks with the same key execute at most once.
+// WithIdempotencyKey ensures tasks with the same key execute at most once
+// (PRD F5). While a task with the key is in flight, submitting again returns
+// ErrDuplicateInFlight; once it reached a terminal state (completed or finally
+// failed), submitting again returns the original outcome instead of a new job.
 // Empty string disables it.
-// TODO(F5): idempotent delivery not yet implemented; field is reserved.
 func WithIdempotencyKey(k string) Option {
 	return func(o *options) { o.IdempotencyKey = k }
 }
@@ -110,9 +114,11 @@ func WithTimeout(d time.Duration) Option {
 	return func(o *options) { o.Timeout = d }
 }
 
-// Handle executes a single dequeued job. Returning nil marks the job
-// completed; returning an error marks it failed.
-type Handle func(ctx context.Context, j *Job) error
+// Handle executes a single dequeued job. It returns the job's result and an
+// error. Returning a nil error marks the job completed and stores the result
+// (returned to later duplicate submissions with the same idempotency key, F5);
+// returning a non-nil error marks it failed.
+type Handle func(ctx context.Context, j *Job) ([]byte, error)
 
 type H map[string]Handle
 
@@ -140,12 +146,59 @@ func Run(ctx context.Context, rdb *RDB, handlemap H, concurrency int) error {
 	return nil
 }
 
+// ErrDuplicateInFlight is returned by Enqueue (as *DuplicateError) when a task
+// with the same idempotency key is still in a non-terminal state (pending,
+// running, scheduled, or waiting for retry). No new job is created.
+var ErrDuplicateInFlight = errors.New("tq: task with the same idempotency key is already in progress")
+
+// DuplicateError describes a rejected duplicate submission (F5).
+type DuplicateError struct {
+	// ID is the existing job that holds the idempotency key.
+	ID uuid.UUID
+}
+
+func (e *DuplicateError) Error() string {
+	return fmt.Sprintf("%s (existing job %s)", ErrDuplicateInFlight, e.ID)
+}
+
+// Unwrap lets callers use errors.Is(err, ErrDuplicateInFlight).
+func (e *DuplicateError) Unwrap() error { return ErrDuplicateInFlight }
+
+// EnqueueResult describes the outcome of an Enqueue call.
+type EnqueueResult struct {
+	// ID is the job that will run. For a duplicate submission it is the ID of
+	// the existing job with the same idempotency key.
+	ID uuid.UUID
+
+	// Duplicate reports whether an existing job with the same idempotency key
+	// was returned instead of enqueueing a new job.
+	Duplicate bool
+
+	// Result is the stored handler result of the existing job; set when
+	// Duplicate is true and that job completed.
+	Result []byte
+
+	// ErrMsg is the stored failure reason of the existing job; set when
+	// Duplicate is true and that job finally failed.
+	ErrMsg string
+}
+
+// Enqueue submits a task to the queue and returns the resulting job.
+//
+// With an idempotency key (WithIdempotencyKey), submitting while a same-key
+// task is in flight returns a *DuplicateError wrapping ErrDuplicateInFlight;
+// submitting after it reached a terminal state returns the original job's
+// outcome (EnqueueResult.Duplicate is true) instead of creating a new job.
+func Enqueue(ctx context.Context, rdb *RDB, t *Task) (*EnqueueResult, error) {
+	return rdb.enqueue(ctx, defaultQueueName, t)
+}
+
 var errNoHandler = errors.New("no handler for task type")
 
 // runJob runs one job's handler with the job's timeout policy.
 // Panics from the handler are converted to errors. It does no queue
 // bookkeeping, so it can be tested with fake handlers, no backend needed.
-func runJob(ctx context.Context, job *Job, handle Handle) (err error) {
+func runJob(ctx context.Context, job *Job, handle Handle) (result []byte, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v", r)
@@ -159,11 +212,11 @@ func runJob(ctx context.Context, job *Job, handle Handle) (err error) {
 	return handle(jobCtx, job)
 }
 
-// settle is the policy decision point after one executctx.Err() != nilion attempt: it decides
-// the job's next state and persists it. On success the job is completed; on
-// failure it is either scheduled for a retry with exponential backoff (while
-// attempts remain) or marked as finally failed.
-func settle(ctx context.Context, rdb *RDB, job *Job, runErr error) {
+// settle is the policy decision point after one execution attempt: it decides
+// the job's next state and persists it. On success the job is completed (with
+// its result stored); on failure it is either scheduled for a retry with
+// exponential backoff (while attempts remain) or marked as finally failed.
+func settle(ctx context.Context, rdb *RDB, job *Job, result []byte, runErr error) {
 	if ctx.Err() != nil {
 		return
 	}
@@ -185,7 +238,7 @@ func settle(ctx context.Context, rdb *RDB, job *Job, runErr error) {
 		}
 		return
 	}
-	if err := retry(3, func() error { return rdb.markAsCompleted(ctx, job) }); err != nil {
+	if err := retry(3, func() error { return rdb.markAsCompleted(ctx, job, result) }); err != nil {
 		slog.Error("markAsCompleted failed after retries",
 			"job_id", job.ID, "type", job.Type, "error", err)
 	}
@@ -210,10 +263,11 @@ func workerLoop(ctx context.Context, wg *sync.WaitGroup, rdb *RDB, handlemap H) 
 		}
 		handle, ok := handlemap[job.Type]
 		if !ok {
-			settle(ctx, rdb, job, errNoHandler)
+			settle(ctx, rdb, job, nil, errNoHandler)
 			continue
 		}
-		settle(ctx, rdb, job, runJob(ctx, job, handle))
+		result, runErr := runJob(ctx, job, handle)
+		settle(ctx, rdb, job, result, runErr)
 	}
 }
 
@@ -285,7 +339,6 @@ func retry(attempts int, fn func() error) error {
 	return err
 }
 
-
 const maxBackoff = 30 * time.Second
 
 // backoff returns the wait before retry number retried (0-based), doubling
@@ -297,4 +350,3 @@ func backoff(retried int) time.Duration {
 	}
 	return d
 }
-

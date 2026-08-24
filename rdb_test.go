@@ -3,6 +3,8 @@ package tq
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -89,21 +91,12 @@ func TestEnqueue(t *testing.T) {
 		t.Run(tc.desc, func(t *testing.T) {
 			testutil.FlushDB(t, client)
 
-			if err := r.enqueue(context.Background(), defaultQueueName, tc.task); err != nil {
+			id, err := r.enqueue(context.Background(), defaultQueueName, tc.task)
+			if err != nil {
 				t.Fatalf("enqueue: %v", err)
 			}
 
-			// The job ID is generated internally — read it from the pending list.
-			pending := testutil.GetList(t, client, pendingKey(defaultQueueName))
-			if len(pending) != 1 {
-				t.Fatalf("pending list has %d entries, want 1", len(pending))
-			}
-			jobID, err := uuid.Parse(pending[0])
-			if err != nil {
-				t.Fatalf("invalid job ID in pending list: %q", pending[0])
-			}
-
-			job := &Job{JobBody: JobBody{ID: jobID}, qname: defaultQueueName}
+			job := &Job{JobBody: JobBody{ID: id.ID}, qname: defaultQueueName}
 			fields := testutil.GetHash(t, client, jobKey(job))
 
 			if got := fields[fieldStatus]; got != StatusPending.String() {
@@ -134,9 +127,11 @@ func TestEnqueueScheduled(t *testing.T) {
 	testutil.FlushDB(t, client)
 
 	before := time.Now().Unix()
-	if err := r.enqueue(context.Background(), defaultQueueName, task); err != nil {
+	res, err := r.enqueue(context.Background(), defaultQueueName, task)
+	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
+	id := res.ID
 	after := time.Now().Unix()
 
 	// A delayed job must NOT land in the pending list.
@@ -160,11 +155,10 @@ func TestEnqueueScheduled(t *testing.T) {
 	if !ok {
 		t.Fatalf("scheduled member is not a string: %v", scheduled[0].Member)
 	}
-	jobID, err := uuid.Parse(member)
-	if err != nil {
-		t.Fatalf("invalid job ID in scheduled zset: %q", member)
+	if member != id.String() {
+		t.Errorf("scheduled member = %q, want %q", member, id.String())
 	}
-	job := &Job{JobBody: JobBody{ID: jobID}, qname: defaultQueueName}
+	job := &Job{JobBody: JobBody{ID: id}, qname: defaultQueueName}
 	fields := testutil.GetHash(t, client, jobKey(job))
 
 	if got := fields[fieldStatus]; got != StatusScheduled.String() {
@@ -435,7 +429,7 @@ func TestMarkAsCompleted(t *testing.T) {
 		}
 		seedRunningJob(t, client, job)
 
-		if err := r.markAsCompleted(context.Background(), job); err != nil {
+		if err := r.markAsCompleted(context.Background(), job, []byte(`{"ok":true}`)); err != nil {
 			t.Fatalf("markAsCompleted: %v", err)
 		}
 
@@ -456,6 +450,9 @@ func TestMarkAsCompleted(t *testing.T) {
 		if got := fields[fieldStatus]; got != StatusCompleted.String() {
 			t.Errorf("status = %q, want %q", got, StatusCompleted.String())
 		}
+		if got := fields[fieldResult]; got != `{"ok":true}` {
+			t.Errorf("result = %q, want %q (handler result must be stored for F5)", got, `{"ok":true}`)
+		}
 	})
 
 	t.Run("job not in running returns error", func(t *testing.T) {
@@ -465,7 +462,7 @@ func TestMarkAsCompleted(t *testing.T) {
 			JobBody: JobBody{ID: uuid.New(), Type: "email:send", Payload: samplePayload},
 			qname:   defaultQueueName,
 		}
-		err := r.markAsCompleted(context.Background(), job)
+		err := r.markAsCompleted(context.Background(), job, nil)
 		if err == nil {
 			t.Fatal("expected error when job is not in running, got nil")
 		}
@@ -629,7 +626,7 @@ func TestFullLifecycle(t *testing.T) {
 
 	// 1. Enqueue.
 	task := NewTask("email:send", samplePayload)
-	if err := r.enqueue(ctx, defaultQueueName, task); err != nil {
+	if _, err := r.enqueue(ctx, defaultQueueName, task); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
 
@@ -648,7 +645,7 @@ func TestFullLifecycle(t *testing.T) {
 	}
 
 	// 3. Complete.
-	if err := r.markAsCompleted(ctx, job); err != nil {
+	if err := r.markAsCompleted(ctx, job, nil); err != nil {
 		t.Fatalf("markAsCompleted: %v", err)
 	}
 
@@ -665,4 +662,248 @@ func TestFullLifecycle(t *testing.T) {
 	if got := fields[fieldStatus]; got != StatusCompleted.String() {
 		t.Errorf("status = %q, want %q", got, StatusCompleted.String())
 	}
+}
+
+// ──────────────────────────── idempotency (F5) ────────────────────────────
+
+// TestEnqueueIdempotency covers PRD F5 at the RDB level: the same idempotency
+// key must never produce a second job while the first is in flight (reject),
+// must resolve to the original outcome once the first is terminal (completed:
+// return the stored result; finally failed: return the failure), must be
+// race-free under concurrent submission (N1), and must expire after the TTL.
+func TestEnqueueIdempotency(t *testing.T) {
+	client := testutil.SetupRedis(t)
+	r := NewRDB(client)
+	ctx := context.Background()
+
+	t.Run("duplicate while pending is rejected", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		first, err := r.enqueue(ctx, defaultQueueName,
+			NewTask("email:send", samplePayload, WithIdempotencyKey("k1")))
+		if err != nil {
+			t.Fatalf("first enqueue: %v", err)
+		}
+
+		dup, err := r.enqueue(ctx, defaultQueueName,
+			NewTask("email:send", samplePayload, WithIdempotencyKey("k1")))
+		if !errors.Is(err, ErrDuplicateInFlight) {
+			t.Fatalf("second enqueue error = %v, want ErrDuplicateInFlight", err)
+		}
+		var dupErr *DuplicateError
+		if !errors.As(err, &dupErr) {
+			t.Fatalf("error type = %T, want *DuplicateError", err)
+		}
+		if dupErr.ID != first.ID {
+			t.Errorf("DuplicateError.ID = %v, want %v (the existing job)", dupErr.ID, first.ID)
+		}
+		if dup != nil {
+			t.Errorf("duplicate result = %+v, want nil when rejected", dup)
+		}
+
+		// Exactly one job exists.
+		pending := testutil.GetList(t, client, pendingKey(defaultQueueName))
+		if len(pending) != 1 {
+			t.Errorf("pending list has %d entries, want 1", len(pending))
+		}
+		if pending[0] != first.ID.String() {
+			t.Errorf("pending[0] = %q, want %q", pending[0], first.ID)
+		}
+	})
+
+	t.Run("duplicate while scheduled is rejected", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		if _, err := r.enqueue(ctx, defaultQueueName,
+			NewTask("email:send", samplePayload, WithIdempotencyKey("k2"), WithDelay(time.Hour))); err != nil {
+			t.Fatalf("first enqueue: %v", err)
+		}
+		if _, err := r.enqueue(ctx, defaultQueueName,
+			NewTask("email:send", samplePayload, WithIdempotencyKey("k2"), WithDelay(time.Hour))); !errors.Is(err, ErrDuplicateInFlight) {
+			t.Fatalf("second enqueue error = %v, want ErrDuplicateInFlight (scheduled is in flight)", err)
+		}
+		if got := testutil.GetZSet(t, client, scheduledKey(defaultQueueName)); len(got) != 1 {
+			t.Errorf("scheduled zset has %d entries, want 1", len(got))
+		}
+	})
+
+	t.Run("duplicate of a completed job returns the stored result", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		first, err := r.enqueue(ctx, defaultQueueName,
+			NewTask("email:send", samplePayload, WithIdempotencyKey("k3")))
+		if err != nil {
+			t.Fatalf("first enqueue: %v", err)
+		}
+
+		// Drive the job to completion with a stored result.
+		job, err := r.dequeue(ctx, defaultQueueName)
+		if err != nil {
+			t.Fatalf("dequeue: %v", err)
+		}
+		if err := r.markAsCompleted(ctx, job, []byte(`{"ok":true}`)); err != nil {
+			t.Fatalf("markAsCompleted: %v", err)
+		}
+
+		dup, err := r.enqueue(ctx, defaultQueueName,
+			NewTask("email:send", samplePayload, WithIdempotencyKey("k3")))
+		if err != nil {
+			t.Fatalf("duplicate enqueue: %v", err)
+		}
+		if !dup.Duplicate {
+			t.Error("want Duplicate = true")
+		}
+		if dup.ID != first.ID {
+			t.Errorf("dup.ID = %v, want %v (the original job)", dup.ID, first.ID)
+		}
+		if string(dup.Result) != `{"ok":true}` {
+			t.Errorf("dup.Result = %q, want %q (the original result)", dup.Result, `{"ok":true}`)
+		}
+		if dup.ErrMsg != "" {
+			t.Errorf("dup.ErrMsg = %q, want empty for a completed job", dup.ErrMsg)
+		}
+
+		// No second job was created.
+		if got := testutil.GetList(t, client, pendingKey(defaultQueueName)); len(got) != 0 {
+			t.Errorf("pending list has %d entries, want 0", len(got))
+		}
+		if got := testutil.GetZSet(t, client, completedKey(defaultQueueName)); len(got) != 1 {
+			t.Errorf("completed zset has %d entries, want 1", len(got))
+		}
+	})
+
+	t.Run("duplicate of a finally failed job returns the failure", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		first, err := r.enqueue(ctx, defaultQueueName,
+			NewTask("email:send", samplePayload, WithIdempotencyKey("k4")))
+		if err != nil {
+			t.Fatalf("first enqueue: %v", err)
+		}
+
+		job, err := r.dequeue(ctx, defaultQueueName)
+		if err != nil {
+			t.Fatalf("dequeue: %v", err)
+		}
+		if err := r.markAsFailed(ctx, job, "boom"); err != nil {
+			t.Fatalf("markAsFailed: %v", err)
+		}
+
+		dup, err := r.enqueue(ctx, defaultQueueName,
+			NewTask("email:send", samplePayload, WithIdempotencyKey("k4")))
+		if err != nil {
+			t.Fatalf("duplicate enqueue: %v", err)
+		}
+		if !dup.Duplicate {
+			t.Error("want Duplicate = true")
+		}
+		if dup.ID != first.ID {
+			t.Errorf("dup.ID = %v, want %v (the original job)", dup.ID, first.ID)
+		}
+		if dup.ErrMsg != "boom" {
+			t.Errorf("dup.ErrMsg = %q, want %q (the original failure)", dup.ErrMsg, "boom")
+		}
+		if len(dup.Result) != 0 {
+			t.Errorf("dup.Result = %q, want empty for a failed job", dup.Result)
+		}
+	})
+
+	t.Run("empty key disables dedup", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		a, err := r.enqueue(ctx, defaultQueueName, NewTask("email:send", samplePayload))
+		if err != nil {
+			t.Fatalf("first enqueue: %v", err)
+		}
+		b, err := r.enqueue(ctx, defaultQueueName, NewTask("email:send", samplePayload))
+		if err != nil {
+			t.Fatalf("second enqueue: %v", err)
+		}
+		if a.ID == b.ID {
+			t.Error("two keyless tasks must be distinct jobs")
+		}
+		if got := testutil.GetList(t, client, pendingKey(defaultQueueName)); len(got) != 2 {
+			t.Errorf("pending list has %d entries, want 2", len(got))
+		}
+	})
+
+	// N1: concurrent submissions of the same key must create exactly one job.
+	t.Run("concurrent submissions of the same key create exactly one job", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+
+		const workers = 16
+		start := make(chan struct{})
+		type outcome struct {
+			res *EnqueueResult
+			err error
+		}
+		results := make(chan outcome, workers)
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				res, err := r.enqueue(ctx, defaultQueueName,
+					NewTask("email:send", samplePayload, WithIdempotencyKey("k-race")))
+				results <- outcome{res: res, err: err}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+
+		var created int
+		var rejected int
+		for res := range results {
+			if res.err != nil {
+				if !errors.Is(res.err, ErrDuplicateInFlight) {
+					t.Fatalf("enqueue: %v", res.err)
+				}
+				rejected++
+				continue
+			}
+			if res.res.Duplicate {
+				t.Error("a non-error enqueue must not be a duplicate")
+			}
+			created++
+		}
+		if created != 1 {
+			t.Errorf("created %d jobs, want exactly 1", created)
+		}
+		if rejected != workers-1 {
+			t.Errorf("rejected %d submissions, want %d", rejected, workers-1)
+		}
+		if got := testutil.GetList(t, client, pendingKey(defaultQueueName)); len(got) != 1 {
+			t.Errorf("pending list has %d entries, want 1", len(got))
+		}
+	})
+
+	t.Run("key expires after the TTL", func(t *testing.T) {
+		testutil.FlushDB(t, client)
+		r.uniqueTTL = time.Second
+
+		first, err := r.enqueue(ctx, defaultQueueName,
+			NewTask("email:send", samplePayload, WithIdempotencyKey("k-ttl")))
+		if err != nil {
+			t.Fatalf("first enqueue: %v", err)
+		}
+
+		time.Sleep(1100 * time.Millisecond) // key is gone; the job may still exist
+
+		second, err := r.enqueue(ctx, defaultQueueName,
+			NewTask("email:send", samplePayload, WithIdempotencyKey("k-ttl")))
+		if err != nil {
+			t.Fatalf("enqueue after TTL: %v", err)
+		}
+		if second.Duplicate {
+			t.Error("want a fresh job after the idempotency key expired")
+		}
+		if second.ID == first.ID {
+			t.Error("want a different job after the idempotency key expired")
+		}
+		if got := testutil.GetList(t, client, pendingKey(defaultQueueName)); len(got) != 2 {
+			t.Errorf("pending list has %d entries, want 2 (both jobs)", len(got))
+		}
+	})
 }

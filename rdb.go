@@ -19,10 +19,16 @@ type RDB struct {
 	// leaseDuration is the running-job lease duration (F12). It is
 	// configurable so tests can use a short lease instead of waiting 30s.
 	leaseDuration time.Duration
+
+	// uniqueTTL is how long an idempotency key stays reserved after its task
+	// is enqueued (F5). It must cover in-flight time plus the result-retention
+	// window, so a duplicate submission within that window resolves to the
+	// original outcome instead of creating a second job. Configurable for tests.
+	uniqueTTL time.Duration
 }
 
 func NewRDB(client redis.UniversalClient) *RDB {
-	return &RDB{client: client, leaseDuration: defaultLeaseDuration}
+	return &RDB{client: client, leaseDuration: defaultLeaseDuration, uniqueTTL: defaultIdempotencyTTL}
 }
 
 // defaultQueueName is the name of the queue this broker serves.
@@ -48,6 +54,7 @@ const (
 	keyStatusFailed    = "tq:{%s}:job:failed"    // qname      ZSet, score = failedAt
 	keyStatusScheduled = "tq:{%s}:job:scheduled" // qname      ZSet, score = scheduledAt
 	keyStatusRetry     = "tq:{%s}:job:retry"     // qname      ZSet, score = nextRetryAt
+	keyUnique          = "tq:{%s}:unique:%s"     // qname, idempotency key  String, value = job id, TTL
 )
 
 func jobKey(j *Job) string             { return fmt.Sprintf(keyJob, j.qname, j.ID) }
@@ -57,6 +64,9 @@ func completedKey(qname string) string { return fmt.Sprintf(keyStatusCompleted, 
 func failedKey(qname string) string    { return fmt.Sprintf(keyStatusFailed, qname) }
 func scheduledKey(qname string) string { return fmt.Sprintf(keyStatusScheduled, qname) }
 func retryKey(qname string) string     { return fmt.Sprintf(keyStatusRetry, qname) }
+func uniqueKey(qname, key string) string {
+	return fmt.Sprintf(keyUnique, qname, key)
+}
 
 const statsTTL = 90 * 24 * time.Hour // 90 days
 
@@ -64,26 +74,63 @@ const statsTTL = 90 * 24 * time.Hour // 90 days
 // it expires, the job can be recovered and re-scheduled by the recovery loop.
 const defaultLeaseDuration = 30 * time.Second
 
+// defaultIdempotencyTTL is the default reservation time of an idempotency key
+// (F5). It is aligned with the F13 result-retention default (1 hour): within
+// that window a duplicate submission of the same key resolves to the original
+// job's outcome rather than creating a new job.
+const defaultIdempotencyTTL = time.Hour
+
 // enqueue adds the given task to the pending list of the queue.
-func (r *RDB) enqueue(ctx context.Context, qname string, t *Task) error {
+//
+// When the task carries an idempotency key (F5), the dedup check and the job
+// creation run inside a single Lua script. Redis executes scripts atomically,
+// so concurrent submissions of the same key serialize and exactly one job is
+// ever created (N1).
+func (r *RDB) enqueue(ctx context.Context, qname string, t *Task) (*EnqueueResult, error) {
 	script := redis.NewScript(`
-local job_key          = KEYS[1]
-local pending_queue    = KEYS[2]
-local scheduled_queue  = KEYS[3]
+local pending_queue     = KEYS[1]
+local scheduled_queue   = KEYS[2]
+local unique_key        = KEYS[3]
 
-local job_id            = ARGV[1]
-local now               = ARGV[2]
-local process_at        = ARGV[3]
-local job_body          = ARGV[4]
-local field_body        = ARGV[5]
-local field_status      = ARGV[6]
-local pending_status    = ARGV[7]
-local scheduled_status  = ARGV[8]
-local field_pending     = ARGV[9]
+local job_key_prefix    = ARGV[1]
+local job_id            = ARGV[2]
+local now               = ARGV[3]
+local process_at        = ARGV[4]
+local job_body          = ARGV[5]
+local field_body        = ARGV[6]
+local field_status      = ARGV[7]
+local pending_status    = ARGV[8]
+local scheduled_status  = ARGV[9]
+local field_pending     = ARGV[10]
+local completed_status  = ARGV[11]
+local failed_status     = ARGV[12]
+local field_result      = ARGV[13]
+local field_error       = ARGV[14]
+local idempotency_key   = ARGV[15]
+local idempotency_ttl   = ARGV[16]
 
-if redis.call("EXISTS", job_key) == 1 then
-  return 0
+-- F5 idempotent delivery: dedup against the reserved unique key. If the key
+-- is free, reserve it for this job before creating the job, so a concurrent
+-- submission of the same key is either rejected (job still in flight) or
+-- served the original outcome (job already terminal) — never duplicated.
+if idempotency_key ~= "" then
+  local existing_id = redis.call("GET", unique_key)
+  if existing_id then
+    local existing_key = job_key_prefix .. existing_id
+    local status = redis.call("HGET", existing_key, field_status)
+    if status == completed_status or status == failed_status then
+      -- Terminal (completed or finally failed): return the stored outcome.
+      return {"2", existing_id,
+              redis.call("HGET", existing_key, field_result) or "",
+              redis.call("HGET", existing_key, field_error) or ""}
+    end
+    -- Still in flight (pending/running/scheduled/retry): reject.
+    return {"1", existing_id}
+  end
+  redis.call("SET", unique_key, job_id, "EX", tonumber(idempotency_ttl))
 end
+
+local job_key = job_key_prefix .. job_id
 
 if tonumber(process_at) > tonumber(now) then
   -- set delay
@@ -100,7 +147,7 @@ elseif tonumber(process_at) == tonumber(now) then
 else -- tonumber(process_at) < tonumber(now)
   return error_reply("nagetive delay")
 end
-return 1
+return {"0", job_id}
 `)
 	jobID := uuid.New()
 	o := defaultOptions()
@@ -114,18 +161,24 @@ return 1
 		Opts:    o,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	now := time.Now()
 	processAt := now.Add(o.Delay)
 
+	ttl := r.uniqueTTL
+	if ttl <= 0 {
+		ttl = defaultIdempotencyTTL
+	}
+
 	keys := []string{
-		fmt.Sprintf(keyJob, qname, jobID),
 		pendingKey(qname),
 		scheduledKey(qname),
+		uniqueKey(qname, o.IdempotencyKey),
 	}
 	argv := []interface{}{
+		fmt.Sprintf(keyJob, qname, ""), // job key prefix; id is appended in-script
 		jobID.String(),
 		now.Unix(),
 		processAt.Unix(),
@@ -135,12 +188,34 @@ return 1
 		StatusPending.String(),
 		StatusScheduled.String(),
 		fieldPendingSince,
+		StatusCompleted.String(),
+		StatusFailed.String(),
+		fieldResult,
+		fieldError,
+		o.IdempotencyKey,
+		int64(ttl / time.Second),
 	}
-	cmd := script.Run(ctx, r.client, keys, argv...)
-	if err := cmd.Err(); err != nil {
-		return err
+	vals, err := script.Run(ctx, r.client, keys, argv...).StringSlice()
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	switch vals[0] {
+	case "0": // new job created
+		return &EnqueueResult{ID: jobID}, nil
+	case "1": // duplicate: the same-key job is still in flight
+		existingID, _ := uuid.Parse(vals[1])
+		return nil, &DuplicateError{ID: existingID}
+	case "2": // duplicate: the same-key job reached a terminal state
+		existingID, _ := uuid.Parse(vals[1])
+		return &EnqueueResult{
+			ID:        existingID,
+			Duplicate: true,
+			Result:    []byte(vals[2]),
+			ErrMsg:    vals[3],
+		}, nil
+	default:
+		return nil, fmt.Errorf("enqueue: unexpected script result %q", vals[0])
+	}
 }
 
 // dequeue atomically moves a job from the pending queue to the running queue
@@ -192,7 +267,7 @@ return redis.call("HGETALL", job_key)
 	return decodeJob(qname, fields)
 }
 
-func (r *RDB) markAsCompleted(ctx context.Context, job *Job) error {
+func (r *RDB) markAsCompleted(ctx context.Context, job *Job, result []byte) error {
 	script := redis.NewScript(`
 local running_queue    = KEYS[1]
 local completed_queue  = KEYS[2]
@@ -202,12 +277,14 @@ local job_id            = ARGV[1]
 local completed_at      = ARGV[2] -- score = completed time for janitor cleanup
 local field_status      = ARGV[3]
 local completed_status  = ARGV[4]
+local field_result      = ARGV[5]
+local result            = ARGV[6]
 
 if redis.call("ZREM", running_queue, job_id) == 0 then
   return redis.error_reply("NOT FOUND")
 end
 redis.call("ZADD", completed_queue, completed_at, job_id)
-redis.call("HSET", job_key, field_status, completed_status)
+redis.call("HSET", job_key, field_status, completed_status, field_result, result)
 return "OK"
 `)
 	keys := []string{
@@ -220,6 +297,8 @@ return "OK"
 		time.Now().Unix(),
 		fieldStatus,
 		StatusCompleted.String(),
+		fieldResult,
+		string(result),
 	}
 	cmd := script.Run(ctx, r.client, keys, args...)
 	if err := cmd.Err(); err != nil {
